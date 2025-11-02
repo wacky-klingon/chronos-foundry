@@ -1,0 +1,45 @@
+# Chronos Trainer Configuration Template
+
+# Data paths
+data:
+  root_dir: "/path/to/your/data"
+  output_dir: "./data/output"
+  cache_dir: "./data/cache"
+
+# Data schema - CUSTOMIZE FOR YOUR DOMAIN
+schema:
+  datetime_column: "timestamp"
+  target_columns:
+    - "target_value"
+  covariate_columns:
+    external_factors: []
+    domain_features: []
+
+# Model configuration
+model:
+  name: "chronos-bolt-base"
+  prediction_length: 64
+  context_length: 512
+
+# Training configuration
+training:
+  preset: "high_quality"
+  time_limit: 3600
+  incremental:
+    enabled: true
+    performance_threshold: 0.05
+    rollback_enabled: true
+
+# Covariate integration
+covariates:
+  enabled: true
+  regressors:
+    - catboost
+    - xgboost
+    - lightgbm
+
+# Data processing
+processing:
+  null_handling: "forward_fill"
+  outlier_detection: true
+  chunk_size: 10000

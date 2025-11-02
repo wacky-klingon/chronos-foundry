@@ -1,0 +1,21 @@
+# AWS Python Script Dependencies
+# Install: pip install -r requirements.txt
+#
+# Usage:
+#   On Dev Machine:  pip install -r aws/requirements.txt
+#   On EC2 Instance: pip install -r /opt/scripts/requirements.txt
+
+# AWS SDK - Required for all scripts
+boto3>=1.34.0
+
+# PyTorch - Required for GPU preflight checks
+# Note: This should match the version in main project's pyproject.toml
+torch>=2.0.0
+
+# Testing - Development only
+pytest>=7.4.0
+pytest-mock>=3.12.0
+
+# Note: The main training environment uses the project's pyproject.toml
+# This requirements.txt is specifically for AWS orchestration scripts
+

@@ -102,7 +102,7 @@ class TestIncrementalTrainer:
     ):
         """
         Test full end-to-end incremental training workflow
-        
+
         This test validates the complete resumable training process:
         - File discovery
         - Data loading
@@ -149,7 +149,7 @@ class TestIncrementalTrainer:
     def test_resume_training(self, temp_dir, sample_data_dir, sample_config):
         """
         Test resuming training from checkpoint
-        
+
         Scenario:
         1. Start training with 2 files
         2. Process 1 file successfully (checkpoint saved)

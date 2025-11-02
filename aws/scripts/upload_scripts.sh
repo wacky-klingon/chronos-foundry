@@ -53,12 +53,12 @@ log_msg() {
 upload_script() {
     local local_path="$1"
     local s3_path="$2"
-    
+
     if [[ ! -f "$local_path" ]]; then
         log_msg ERROR "Script not found: $local_path"
         return 1
     fi
-    
+
     log_msg INFO "Uploading $local_path -> $s3_path"
     if aws s3 cp "$local_path" "$s3_path" --profile "$AWS_PROFILE"; then
         log_msg SUCCESS "Uploaded: $(basename "$local_path")"

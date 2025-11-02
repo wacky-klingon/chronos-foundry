@@ -86,13 +86,11 @@ class TestIncrementalTrainer:
 
             # Incremental training configuration
             "incremental_training": {
-                "incremental_training": {
-                    "model_versioning": True,
-                    "performance_threshold": 0.05,
-                    "rollback_enabled": True,
-                    "checkpoint_dir": str(Path(temp_dir) / "checkpoints"),
-                    "model_base_path": str(Path(temp_dir) / "models"),
-                }
+                "model_versioning": True,
+                "performance_threshold": 0.05,
+                "rollback_enabled": True,
+                "checkpoint_dir": str(Path(temp_dir) / "checkpoints"),
+                "model_base_path": str(Path(temp_dir) / "models"),
             },
         }
 

@@ -474,8 +474,15 @@ class IncrementalTrainer(CovariateTrainer):
                 self.logger.info(
                     f"Resuming from checkpoint: {last_checkpoint['year']:04d}-{last_checkpoint['month']:02d}"
                 )
-                predictor = last_checkpoint["model"]
-                training_state = last_checkpoint["training_state"]
+                predictor = last_checkpoint.get("model")  # May not exist if model file missing
+                training_state = last_checkpoint.get("training_state", {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "validation_start_date": validation_start_date,
+                    "validation_end_date": validation_end_date,
+                    "processed_files": [],
+                    "total_files": 0,
+                })
             else:
                 self.logger.info("Starting fresh training")
                 predictor = None
@@ -526,57 +533,9 @@ class IncrementalTrainer(CovariateTrainer):
                     continue
 
                 # Train model incrementally
-                if predictor is None:
-                    # First file - create new predictor
-                    model_base_path = self.incremental_config.get(
-                        "model_base_path", "data/models/incremental"
-                    )
-                    temp_model_path = (
-                        f"{model_base_path}/temp_model_{year:04d}_{month:02d}"
-                    )
-                    predictor = TimeSeriesPredictor(
-                        target=self.config.get("target_col", "target"),
-                        prediction_length=self.prediction_length,
-                        path=temp_model_path,
-                    )
-                    predictor.fit(ts_df, presets=self.training_preset)
-                else:
-                    # Subsequent files - create new predictor and train on combined data
-                    # Load previous data and combine with current data
-                    previous_data = self._load_previous_training_data(
-                        training_state["processed_files"]
-                    )
-                    if previous_data is not None:
-                        combined_data = pd.concat(
-                            [previous_data, ts_df], ignore_index=True
-                        )
-                        # Create new predictor for combined data
-                        model_base_path = self.incremental_config.get(
-                            "model_base_path", "data/models/incremental"
-                        )
-                        temp_model_path = (
-                            f"{model_base_path}/temp_model_{year:04d}_{month:02d}"
-                        )
-                        predictor = TimeSeriesPredictor(
-                            target=self.config.get("target_col", "target"),
-                            prediction_length=self.prediction_length,
-                            path=temp_model_path,
-                        )
-                        predictor.fit(combined_data, presets=self.training_preset)
-                    else:
-                        # Fallback: just train on current data
-                        model_base_path = self.incremental_config.get(
-                            "model_base_path", "data/models/incremental"
-                        )
-                        temp_model_path = (
-                            f"{model_base_path}/temp_model_{year:04d}_{month:02d}"
-                        )
-                        predictor = TimeSeriesPredictor(
-                            target=self.config.get("target_col", "target"),
-                            prediction_length=self.prediction_length,
-                            path=temp_model_path,
-                        )
-                        predictor.fit(ts_df, presets=self.training_preset)
+                predictor = self._train_predictor(
+                    predictor, ts_df, year, month, training_state["processed_files"]
+                )
 
                 # Get data stats
                 data_stats = resumable_loader.get_data_stats(df)
@@ -680,6 +639,70 @@ class IncrementalTrainer(CovariateTrainer):
         except Exception as e:
             self.logger.error(f"Failed to resume training: {e}")
             return {"status": "error", "message": f"Failed to resume training: {e}"}
+
+    def _train_predictor(
+        self,
+        previous_predictor: Optional[TimeSeriesPredictor],
+        ts_df: TimeSeriesDataFrame,
+        year: int,
+        month: int,
+        processed_files: List[Dict[str, Any]],
+    ) -> TimeSeriesPredictor:
+        """
+        Train a predictor on the given data, optionally using previous predictor or data.
+
+        Args:
+            previous_predictor: Previous predictor from checkpoint (if resuming)
+            ts_df: Current time series data to train on
+            year: Year of current data
+            month: Month of current data
+            processed_files: List of previously processed files (for combining data)
+
+        Returns:
+            Trained TimeSeriesPredictor
+        """
+        model_base_path = self.incremental_config.get(
+            "model_base_path", "data/models/incremental"
+        )
+        temp_model_path = f"{model_base_path}/temp_model_{year:04d}_{month:02d}"
+
+        if previous_predictor is None:
+            # First file - create new predictor
+            predictor = TimeSeriesPredictor(
+                target=self.config.get("target_col", "target"),
+                prediction_length=self.prediction_length,
+                path=temp_model_path,
+            )
+            predictor.fit(ts_df, presets=self.training_preset)
+        else:
+            # Subsequent files - create new predictor and train on combined data
+            # Load previous data and combine with current data
+            previous_data = self._load_previous_training_data(processed_files)
+            if previous_data is not None:
+                # Convert previous data to TimeSeriesDataFrame
+                from ..data.resumable_loader import ResumableDataLoader
+
+                base_data_path = ConfigHelpers.get_parquet_root_dir(self.config)
+                resumable_loader = ResumableDataLoader(base_data_path, checkpoint_manager=None)
+                previous_ts_df = resumable_loader.convert_to_timeseries_dataframe(
+                    previous_data, self.config
+                )
+                if previous_ts_df is not None:
+                    combined_data = pd.concat([previous_ts_df, ts_df], ignore_index=True)
+                else:
+                    combined_data = ts_df
+            else:
+                combined_data = ts_df
+
+            # Create new predictor for combined data
+            predictor = TimeSeriesPredictor(
+                target=self.config.get("target_col", "target"),
+                prediction_length=self.prediction_length,
+                path=temp_model_path,
+            )
+            predictor.fit(combined_data, presets=self.training_preset)
+
+        return predictor
 
     def _load_validation_data(
         self, start_date: str, end_date: str

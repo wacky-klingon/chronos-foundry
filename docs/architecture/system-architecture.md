@@ -86,9 +86,13 @@ This document describes the design principles, architecture, and implementation 
 │ S3 Bucket                            │
 │                                      │
 │ cached-datasets/                     │
+│   ├─ 2010/01/                        │
+│   ├─ 2010/02/                        │
+│   └─ ... (date-based structure)      │
+│                                      │
+│ runtime/                              │
 │   ├─ python-env/                     │
-│   ├─ scripts/                        │
-│   └─ training-data/                  │
+│   └─ scripts/                        │
 │                                      │
 │ {env}/                               │
 │   ├─ system-state.json (atomic)      │
@@ -196,18 +200,20 @@ Local → S3 (cached-datasets) → EC2 (/data) → Training → EC2 (/data/outpu
 **S3 Bucket Structure**:
 ```
 s3://bucket/
-├── cached-datasets/              # Immutable, long-lived
+├── cached-datasets/              # Immutable, long-lived (read-only)
+│   ├── 2010/01/                 # Parquet files by year/month
+│   ├── 2010/02/
+│   └── ...                      # Additional date-based directories
+│
+├── runtime/                      # Mutable runtime resources (write access)
 │   ├── python-env/
 │   │   └── chronos-venv-3.11.13.tar.gz
-│   ├── scripts/
-│   │   ├── bootstrap.sh
-│   │   ├── preflight_check.py
-│   │   ├── training_wrapper.py
-│   │   └── lib/
-│   │       └── state_helpers.sh
-│   └── training-data/            # Parquet files
-│       ├── file1.parquet
-│       └── file2.parquet
+│   └── scripts/
+│       ├── bootstrap.sh
+│       ├── preflight_check.py
+│       ├── training_wrapper.py
+│       └── lib/
+│           └── state_helpers.sh
 │
 ├── dev/                          # Ephemeral, per-run
 │   ├── system-state.json         # Atomic state tracking

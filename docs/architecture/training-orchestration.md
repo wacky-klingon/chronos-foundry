@@ -200,11 +200,20 @@ The system implements security through VPC configuration, security groups, and I
 
 ```
 s3://chronos-training-{account}-{region}/
-├── cached-datasets/              # Read-only training data
+├── cached-datasets/              # Read-only training data (immutable)
 │   ├── 2010/01/                 # Parquet files by year/month
 │   ├── 2010/02/
-│   └── python-env/              # Pre-built .venv archives
-│       └── chronos-venv-3.11.13.tar.gz
+│   └── ...                      # Additional date-based directories
+│
+├── runtime/                      # Mutable runtime resources (write access)
+│   ├── python-env/              # Pre-built .venv archives
+│   │   └── chronos-venv-3.11.13.tar.gz
+│   └── scripts/                 # Bootstrap and training scripts
+│       ├── bootstrap.sh
+│       ├── preflight_check.py
+│       ├── training_wrapper.py
+│       └── lib/
+│           └── state_helpers.sh
 │
 ├── dev/                          # Dev environment training runs
 ├── stage/                        # Stage environment training runs
@@ -224,7 +233,8 @@ s3://chronos-training-{account}-{region}/
 ### Data Sync Operations
 
 **Sync Direction**:
-- **cached-datasets/** → EC2: Read-only (training data, Python env)
+- **cached-datasets/** → EC2: Read-only (training data - date-based parquet files)
+- **runtime/** → EC2: Read-only (Python env, bootstrap scripts)
 - **{env}/** ← EC2: Write-only (dev/, stage/, prod/ - outputs, logs, state files)
 
 **Sync Triggers**:
@@ -244,8 +254,8 @@ s3://chronos-training-{account}-{region}/
 - **State files**: Deleted on run completion
 
 **Long-term Data** (Manual management):
-- **Cached datasets** (`cached-datasets/`): Indefinite retention
-- **Python environments**: Manual versioning, cleanup old versions as needed
+- **Cached datasets** (`cached-datasets/`): Indefinite retention (read-only training data)
+- **Runtime resources** (`runtime/`): Manual versioning, cleanup old versions as needed (python-env, scripts)
 
 ### Data Security
 

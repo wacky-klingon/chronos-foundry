@@ -60,23 +60,24 @@ tar -czf venv.tar.gz .venv/
 
 # Upload to S3
 export BUCKET=your-bucket-name
-aws s3 cp venv.tar.gz s3://$BUCKET/cached-datasets/python-env/chronos-venv-3.11.13.tar.gz
+aws s3 cp venv.tar.gz s3://$BUCKET/runtime/python-env/chronos-venv-3.11.13.tar.gz
 ```
 
 ## Step 3: Upload Training Data (5 minutes)
 
 ```bash
 # Prepare sample dataset (or use your own Parquet files)
-mkdir -p training-data
-# ... add your .parquet files here ...
+# Organize by date: YYYY/MM/ structure
+mkdir -p 2020/01
+# ... add your .parquet files to 2020/01/ ...
 
-# Upload to S3
-aws s3 sync ./training-data/ s3://$BUCKET/cached-datasets/training-data/
+# Upload to S3 (date-based structure)
+aws s3 sync ./2020/ s3://$BUCKET/cached-datasets/2020/
 
 # Upload scripts
 cd aws/scripts
-aws s3 sync . s3://$BUCKET/cached-datasets/scripts/ --exclude "*.sh"
-aws s3 sync . s3://$BUCKET/cached-datasets/scripts/ --include "*.sh" --include "*.py"
+aws s3 sync . s3://$BUCKET/runtime/scripts/ --exclude "*.sh"
+aws s3 sync . s3://$BUCKET/runtime/scripts/ --include "*.sh" --include "*.py"
 ```
 
 ## Step 4: Create Training Config (2 minutes)
@@ -198,8 +199,8 @@ cd aws/cdk && cdk deploy
 
 **Error**: State file shows `"current_step": "data_sync"` for > 10 minutes
 ```bash
-# Check dataset size
-aws s3 ls s3://$BUCKET/cached-datasets/training-data/ --recursive --summarize
+# Check dataset size (date-based structure)
+aws s3 ls s3://$BUCKET/cached-datasets/2020/ --recursive --summarize
 
 # Check instance console output
 INSTANCE_ID=$(aws s3 cp s3://$BUCKET/dev/system-state.json - | jq -r .instance_id)

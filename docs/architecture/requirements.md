@@ -88,7 +88,7 @@ See [Future Enhancements](future-enhancements.md) for deferred features.
 
 **Acceptance Criteria**:
 
-- Pre-built .venv stored in S3 (`s3://bucket/cached-datasets/python-env/`)
+- Pre-built .venv stored in S3 (`s3://bucket/runtime/python-env/`)
 - Python 3.11.13 environment with all dependencies
 - Poetry used only on developer machine; EC2 never runs Poetry
 - Bundle pyproject.toml, poetry.lock, and venv-metadata.json for provenance

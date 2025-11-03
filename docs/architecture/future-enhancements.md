@@ -450,7 +450,7 @@ phase1/* → Intelligent-Tiering at day 7 → Glacier at day 30 → Delete at da
 **Enhancement:** Granular lifecycle rules per data type
 - `phase1/logs/` → IA at day 7 → Delete at day 14
 - `phase1/models/` → IA at day 7 → Glacier at day 30 → Delete at day 60
-- `cached-datasets/python-env/` → IA at day 30 → Delete at day 90
+- `runtime/python-env/` → IA at day 30 → Delete at day 90
 
 **Why deferred:**
 - Don't know actual access patterns yet

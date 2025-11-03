@@ -322,7 +322,7 @@ Each environment creates an isolated stack with separate resources. Stack names,
 
 ### Post-Deployment Setup
 
-After successful deployment, verify infrastructure in the AWS Console, note CloudFormation export names (format: `ChronosTraining-{env}-{ResourceType}`), and upload cached datasets to `s3://chronos-training-{env}-{account}-{region}/cached-datasets/`. Pre-built Python virtual environments should be uploaded to the `cached-datasets/python-env/` prefix. Runtime scripts documented in [Training Orchestration](training-orchestration.md) consume CloudFormation exports automatically.
+After successful deployment, verify infrastructure in the AWS Console, note CloudFormation export names (format: `ChronosTraining-{env}-{ResourceType}`), and upload cached datasets to `s3://chronos-training-{env}-{account}-{region}/cached-datasets/` (date-based structure: `YYYY/MM/`). Pre-built Python virtual environments should be uploaded to the `runtime/python-env/` prefix. Runtime scripts should be uploaded to `runtime/scripts/`. Runtime scripts documented in [Training Orchestration](training-orchestration.md) consume CloudFormation exports automatically.
 
 ## Reference
 

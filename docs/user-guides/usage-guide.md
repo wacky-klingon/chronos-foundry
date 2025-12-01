@@ -720,6 +720,42 @@ if data_hash != last_training_hash:
 
 ---
 
+## Updating S3 Data (Admin Task)
+
+When you generate new configs or cached datasets, upload them to S3. Simple process: remove old files and upload new ones.
+
+```bash
+# Use admin credentials (trainer-runtime has read-only access)
+export AWS_PROFILE=admin
+export BUCKET_NAME=YOUR-BUCKET-NAME  # or get from CloudFormation exports
+
+# Upload new cached datasets (replace LOCAL_DATA_PATH with your local path)
+aws s3 rm s3://${BUCKET_NAME}/cached-datasets/training-data/ --recursive
+aws s3 sync LOCAL_DATA_PATH \
+    s3://${BUCKET_NAME}/cached-datasets/training-data/ \
+    --exclude "*.tmp" \
+    --exclude "*.log" \
+    --exclude "__pycache__/*" \
+    --exclude "*.pyc" \
+    --profile admin
+
+# Upload new config files (navigate to your project directory first)
+cd your-project
+aws s3 rm s3://${BUCKET_NAME}/cached-datasets/configs/ --recursive
+aws s3 cp config/parquet_loader_config.ec2.yaml \
+    s3://${BUCKET_NAME}/cached-datasets/configs/parquet_loader_config.yaml \
+    --profile admin
+aws s3 cp config/train.ec2.yaml \
+    s3://${BUCKET_NAME}/cached-datasets/configs/train.yaml \
+    --profile admin
+
+# Verify uploads
+aws s3 ls s3://${BUCKET_NAME}/cached-datasets/training-data/ --recursive --profile admin | head -20
+aws s3 ls s3://${BUCKET_NAME}/cached-datasets/configs/ --profile admin
+```
+
+**Note**: This is an **admin-only task**. The `trainer-runtime` user has read-only S3 access.
+
 ## Troubleshooting
 
 ### Common Issues
@@ -746,6 +782,10 @@ for chunk in loader.load_chunks(chunk_size=10000):
 # Verify IAM role has required permissions
 aws sts get-caller-identity
 aws s3 ls s3://your-bucket/
+
+# If you get AccessDenied, switch to admin credentials:
+export AWS_PROFILE=admin
+aws sts get-caller-identity  # Should show admin user, not trainer-runtime
 ```
 
 ---

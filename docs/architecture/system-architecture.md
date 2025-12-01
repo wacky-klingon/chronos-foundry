@@ -201,19 +201,23 @@ Local → S3 (cached-datasets) → EC2 (/data) → Training → EC2 (/data/outpu
 ```
 s3://bucket/
 ├── cached-datasets/              # Immutable, long-lived (read-only)
-│   ├── 2010/01/                 # Parquet files by year/month
-│   ├── 2010/02/
-│   └── ...                      # Additional date-based directories
-│
-├── runtime/                      # Mutable runtime resources (write access)
-│   ├── python-env/
-│   │   └── chronos-venv-3.11.13.tar.gz
-│   └── scripts/
-│       ├── bootstrap.sh
-│       ├── preflight_check.py
-│       ├── training_wrapper.py
-│       └── lib/
-│           └── state_helpers.sh
+│   ├── training-data/            # Parquet files synced to EC2 /data/
+│   │   ├── 2010/01/             # Parquet files by year/month
+│   │   ├── 2010/02/
+│   │   └── ...                   # Additional date-based directories
+│   ├── configs/                 # EC2 config files synced to /opt/heisenberg-engine/config/
+│   │   ├── parquet_loader_config.yaml
+│   │   ├── train.yaml
+│   │   ├── covariate_config.yaml
+│   │   └── incremental_training_config.yaml
+│   ├── scripts/                 # Bootstrap and training scripts
+│   │   ├── bootstrap.sh
+│   │   ├── preflight_check.py
+│   │   ├── training_wrapper.py
+│   │   └── lib/
+│   │       └── state_helpers.sh
+│   └── python-env/              # Pre-built Python environments
+│       └── chronos-venv-3.11.13.tar.gz
 │
 ├── dev/                          # Ephemeral, per-run
 │   ├── system-state.json         # Atomic state tracking

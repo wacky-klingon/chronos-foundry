@@ -115,12 +115,40 @@ Upload your training data to S3:
 # Upload training dataset (Parquet files)
 aws s3 sync ./data/ s3://YOUR-BUCKET/cached-datasets/training-data/
 
-# Upload training config
-aws s3 cp ./config.yaml s3://YOUR-BUCKET/dev/config.yaml
-
 # Upload scripts and Python environment
 aws s3 sync ./aws/scripts/ s3://YOUR-BUCKET/cached-datasets/scripts/
 aws s3 cp ./venv.tar.gz s3://YOUR-BUCKET/cached-datasets/python-env/chronos-venv-3.11.13.tar.gz
+```
+
+### 2a. Upload EC2 Config Files (Admin Task)
+
+**Note**: This requires admin credentials. The `trainer-runtime` user has read-only S3 access.
+
+```bash
+# Use admin credentials
+export AWS_PROFILE=admin
+export BUCKET_NAME=YOUR-BUCKET-NAME  # or get from CloudFormation exports
+
+# Navigate to your project directory
+cd your-project
+
+# Upload EC2 config files (adjust file names to match your project)
+aws s3 cp config/parquet_loader_config.ec2.yaml \
+    s3://${BUCKET_NAME}/cached-datasets/configs/parquet_loader_config.yaml \
+    --profile admin
+
+aws s3 cp config/train.ec2.yaml \
+    s3://${BUCKET_NAME}/cached-datasets/configs/train.yaml \
+    --profile admin
+
+# Upload other configs if they exist
+aws s3 cp config/covariate_config.yaml \
+    s3://${BUCKET_NAME}/cached-datasets/configs/covariate_config.yaml \
+    --profile admin || true
+
+aws s3 cp config/incremental_training_config.yaml \
+    s3://${BUCKET_NAME}/cached-datasets/configs/incremental_training_config.yaml \
+    --profile admin || true
 ```
 
 ### 3. Launch Training

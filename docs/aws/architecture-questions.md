@@ -30,13 +30,29 @@
 
 **Answer**:
 ```
-s3://your-bucket/<other paths>/
+s3://${BUCKET_NAME}/
 ├── cached-datasets/          # Read-only, source of truth
-├── logs/                     # Bidirectional sync
-├── models/                   # Bidirectional sync
-└── checkpoints/              # Bidirectional sync
+│   ├── training-data/        # Parquet files synced to EC2 /data/
+│   │   ├── 2014/01/         # Year/month directory structure
+│   │   ├── 2014/02/
+│   │   └── ...
+│   └── configs/             # EC2 config files synced to /opt/heisenberg-engine/config/
+│       ├── parquet_loader_config.yaml
+│       ├── train.yaml
+│       ├── covariate_config.yaml
+│       └── incremental_training_config.yaml
+├── runtime/                  # Bootstrap scripts, Python environments
+│   ├── python-env/
+│   └── scripts/
+├── {env}/                    # Environment-specific (dev/stage/prod)
+│   ├── {run_id}/            # Training run outputs
+│   │   ├── models/
+│   │   ├── checkpoints/
+│   │   └── config.yaml
+│   └── logs/
+│       └── {run_id}/
+└── system-state.json         # Atomic state tracking
 ```
-Open to design improvements
 
 ### 2. Local vs S3 Paths
 **Question**: Are the local paths different from S3 paths?
@@ -45,8 +61,10 @@ Open to design improvements
 We need to map S3 path to local path, using the S3 sync or tools. Let's assume that they are separate and require one-to-one mapping.
 
 For example:
-- **Local**: `/home/user/data/cached_datasets/` → **S3**: `s3://bucket/cached-datasets/`
-- **Local**: `/home/user/logs/` → **S3**: `s3://bucket/logs/`
+- **Local Dev**: `LOCAL_DATA_PATH/` → **S3**: `s3://bucket/cached-datasets/training-data/`
+- **EC2 Training**: `/data/` (synced from S3) ← **S3**: `s3://bucket/cached-datasets/training-data/`
+- **EC2 Configs**: `/opt/heisenberg-engine/config/` (synced from S3) ← **S3**: `s3://bucket/cached-datasets/configs/`
+- **EC2 Outputs**: `/data/output/` → **S3**: `s3://bucket/{env}/{run_id}/`
 
 ### 3. Sync Direction
 - **Cached datasets**: S3 → Local only (read-only)
@@ -101,17 +119,26 @@ Based on the design requirements:
 
 ```
 Local EC2 Instance:
-├── data/
-│   ├── cached_datasets/     # S3 → Local (read-only)
-│   ├── logs/                # Local ↔ S3 (bidirectional)
-│   ├── models/              # Local ↔ S3 (bidirectional)
-│   └── checkpoints/         # Local ↔ S3 (bidirectional)
+├── /data/                   # S3 → Local (read-only)
+│   ├── 2014/01/            # Parquet files synced from cached-datasets/training-data/
+│   ├── 2014/02/
+│   └── ...
+├── /opt/heisenberg-engine/config/  # S3 → Local (read-only)
+│   ├── parquet_loader_config.yaml
+│   ├── train.yaml
+│   └── ...
+└── /data/output/           # Local → S3 (write-only)
+    ├── models/
+    └── checkpoints/
 
 S3 Bucket:
-├── cached-datasets/         # Source of truth (read-only)
-├── logs/                    # Bidirectional sync
-├── models/                  # Bidirectional sync
-└── checkpoints/             # Bidirectional sync
+├── cached-datasets/
+│   ├── training-data/      # Source of truth (read-only, synced to /data/)
+│   └── configs/            # EC2 configs (read-only, synced to /opt/heisenberg-engine/config/)
+└── {env}/{run_id}/         # Training outputs (write-only from EC2)
+    ├── models/
+    ├── checkpoints/
+    └── logs/
 ```
 
 ## Additional Questions

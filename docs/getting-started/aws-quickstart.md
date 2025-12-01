@@ -71,31 +71,50 @@ aws s3 cp venv.tar.gz s3://$BUCKET/runtime/python-env/chronos-venv-3.11.13.tar.g
 mkdir -p 2020/01
 # ... add your .parquet files to 2020/01/ ...
 
-# Upload to S3 (date-based structure)
-aws s3 sync ./2020/ s3://$BUCKET/cached-datasets/2020/
+# Upload to S3 (date-based structure under training-data/)
+aws s3 sync ./2020/ s3://$BUCKET/cached-datasets/training-data/2020/
 
 # Upload scripts
 cd aws/scripts
-aws s3 sync . s3://$BUCKET/runtime/scripts/ --exclude "*.sh"
-aws s3 sync . s3://$BUCKET/runtime/scripts/ --include "*.sh" --include "*.py"
+aws s3 sync . s3://$BUCKET/cached-datasets/scripts/ --exclude "*.sh"
+aws s3 sync . s3://$BUCKET/cached-datasets/scripts/ --include "*.sh" --include "*.py"
 ```
 
-## Step 4: Create Training Config (2 minutes)
+## Step 4: Upload EC2 Config Files (2 minutes)
+
+**Note**: This is an admin-only task. Use admin credentials (not trainer-runtime profile).
 
 ```bash
-cat > config.yaml <<EOF
-prediction_length: 64
-context_length: 512
-model_id: "amazon/chronos-t5-small"
-num_samples: 10000
-batch_size: 32
-learning_rate: 0.001
-epochs: 10
-EOF
+# Use admin credentials
+export AWS_PROFILE=admin  # or your admin profile
+export BUCKET_NAME=your-bucket-name  # or get from CloudFormation exports
 
-# Upload config
-aws s3 cp config.yaml s3://$BUCKET/dev/config.yaml
+# Navigate to your project directory
+cd your-project
+
+# Upload EC2 config files to S3 (adjust config file names to match your project)
+aws s3 cp config/parquet_loader_config.ec2.yaml \
+    s3://${BUCKET_NAME}/cached-datasets/configs/parquet_loader_config.yaml \
+    --profile admin
+
+aws s3 cp config/train.ec2.yaml \
+    s3://${BUCKET_NAME}/cached-datasets/configs/train.yaml \
+    --profile admin
+
+# Upload other configs if they exist
+aws s3 cp config/covariate_config.yaml \
+    s3://${BUCKET_NAME}/cached-datasets/configs/covariate_config.yaml \
+    --profile admin || true
+
+aws s3 cp config/incremental_training_config.yaml \
+    s3://${BUCKET_NAME}/cached-datasets/configs/incremental_training_config.yaml \
+    --profile admin || true
+
+# Verify uploads
+aws s3 ls s3://${BUCKET_NAME}/cached-datasets/configs/ --profile admin
 ```
+
+**Note**: Create EC2-specific config files (`.ec2.yaml`) with paths adjusted for EC2 (typically `/data/` instead of local paths).
 
 ## Step 5: Launch Training (2 minutes + training time)
 
@@ -199,8 +218,8 @@ cd aws/cdk && cdk deploy
 
 **Error**: State file shows `"current_step": "data_sync"` for > 10 minutes
 ```bash
-# Check dataset size (date-based structure)
-aws s3 ls s3://$BUCKET/cached-datasets/2020/ --recursive --summarize
+# Check dataset size (date-based structure under training-data/)
+aws s3 ls s3://$BUCKET/cached-datasets/training-data/2020/ --recursive --summarize
 
 # Check instance console output
 INSTANCE_ID=$(aws s3 cp s3://$BUCKET/dev/system-state.json - | jq -r .instance_id)

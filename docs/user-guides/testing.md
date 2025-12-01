@@ -199,6 +199,41 @@ def test_training_performance(benchmark):
     assert result is not None
 ```
 
+## Updating S3 Data (Admin Task)
+
+When you generate new configs or cached datasets, upload them to S3:
+
+```bash
+# Use admin credentials (trainer-runtime has read-only access)
+export AWS_PROFILE=admin
+export BUCKET_NAME=YOUR-BUCKET-NAME  # or get from CloudFormation exports
+
+# Upload new cached datasets (replace LOCAL_DATA_PATH with your local path)
+aws s3 rm s3://${BUCKET_NAME}/cached-datasets/training-data/ --recursive
+aws s3 sync LOCAL_DATA_PATH \
+    s3://${BUCKET_NAME}/cached-datasets/training-data/ \
+    --exclude "*.tmp" \
+    --exclude "*.log" \
+    --exclude "__pycache__/*" \
+    --exclude "*.pyc" \
+    --profile admin
+
+# Upload new config files (navigate to your project directory first)
+cd your-project
+aws s3 rm s3://${BUCKET_NAME}/cached-datasets/configs/ --recursive
+aws s3 cp config/parquet_loader_config.ec2.yaml \
+    s3://${BUCKET_NAME}/cached-datasets/configs/parquet_loader_config.yaml \
+    --profile admin
+aws s3 cp config/train.ec2.yaml \
+    s3://${BUCKET_NAME}/cached-datasets/configs/train.yaml \
+    --profile admin
+
+# Verify uploads
+aws s3 ls s3://${BUCKET_NAME}/cached-datasets/configs/ --profile admin
+```
+
+**Note**: This is an admin-only task. The `trainer-runtime` user has read-only S3 access.
+
 ## Additional Resources
 
 - [pytest documentation](https://docs.pytest.org/)

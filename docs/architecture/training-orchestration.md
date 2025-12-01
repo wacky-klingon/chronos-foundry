@@ -201,17 +201,25 @@ The system implements security through VPC configuration, security groups, and I
 ```
 s3://chronos-training-{account}-{region}/
 ├── cached-datasets/              # Read-only training data (immutable)
-│   ├── 2010/01/                 # Parquet files by year/month
-│   ├── 2010/02/
-│   └── ...                      # Additional date-based directories
+│   ├── training-data/            # Parquet files synced to EC2 /data/
+│   │   ├── 2010/01/             # Parquet files by year/month
+│   │   ├── 2010/02/
+│   │   └── ...                   # Additional date-based directories
+│   ├── configs/                 # EC2 config files synced to /opt/heisenberg-engine/config/
+│   │   ├── parquet_loader_config.yaml
+│   │   ├── train.yaml
+│   │   ├── covariate_config.yaml
+│   │   └── incremental_training_config.yaml
+│   ├── scripts/                 # Bootstrap and training scripts
+│   │   ├── bootstrap.sh
+│   │   ├── preflight_check.py
+│   │   ├── training_wrapper.py
+│   └── python-env/              # Pre-built .venv archives
+│       └── chronos-venv-3.11.13.tar.gz
 │
 ├── runtime/                      # Mutable runtime resources (write access)
-│   ├── python-env/              # Pre-built .venv archives
-│   │   └── chronos-venv-3.11.13.tar.gz
-│   └── scripts/                 # Bootstrap and training scripts
-│       ├── bootstrap.sh
-│       ├── preflight_check.py
-│       ├── training_wrapper.py
+│   ├── python-env/              # Alternative location (legacy)
+│   └── scripts/                  # Alternative location (legacy)
 │       └── lib/
 │           └── state_helpers.sh
 │

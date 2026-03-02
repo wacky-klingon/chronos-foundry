@@ -8,7 +8,7 @@ import traceback
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Import AutoGluon components
 try:
@@ -675,22 +675,55 @@ class IncrementalTrainer(CovariateTrainer):
         )
         temp_model_path = f"{model_base_path}/temp_model_{year:04d}_{month:02d}"
 
+        # TODO: Compare training with vs without TiDE in excluded_model_types.
+        # TiDE is 71-81% of runtime; include it to test quality impact on WQL/MASE.
+        excluded = self.incremental_config.get(
+            "excluded_model_types", ["TemporalFusionTransformer"]
+        )
+        known_covariates = self.incremental_config.get("known_covariates", [])
+        lookback_days = self.incremental_config.get("lookback_days")
+
         if previous_predictor is None:
             # First file - create new predictor
             predictor = TimeSeriesPredictor(
                 target=self.config.get("target_col", "target"),
                 prediction_length=self.prediction_length,
+                known_covariates_names=known_covariates,
                 path=temp_model_path,
             )
             predictor.fit(
                 ts_df,
                 presets=self.training_preset,
-                excluded_model_types=["TemporalFusionTransformer"],
+                excluded_model_types=excluded,
             )
         else:
-            # Subsequent files - create new predictor and train on combined data
+            # Subsequent files - require lookback_days to avoid O(N^2) unbounded history
+            if lookback_days is None:
+                raise IncrementalTrainingError(
+                    "incremental_training.lookback_days is required. "
+                    "Set it in config to cap training history (e.g. lookback_days: 90)."
+                )
+            if not isinstance(lookback_days, (int, float)) or lookback_days < 0:
+                raise IncrementalTrainingError(
+                    f"incremental_training.lookback_days must be a non-negative number, got: {lookback_days!r}"
+                )
+            lookback_days = int(lookback_days)
+
+            current_start = datetime(year, month, 1)
+            cutoff = current_start - timedelta(days=lookback_days)
+            windowed_files = [
+                fi
+                for fi in processed_files
+                if datetime(fi["year"], fi["month"], 1) >= cutoff
+            ]
+            lookback_desc = f"lookback_days={lookback_days}"
+
+            self.logger.info(
+                "Training month %04d-%02d on %d months of history (%s)",
+                year, month, len(windowed_files), lookback_desc,
+            )
             # Load previous data and combine with current data
-            previous_data = self._load_previous_training_data(processed_files)
+            previous_data = self._load_previous_training_data(windowed_files)
             if previous_data is not None:
                 # Convert previous data to TimeSeriesDataFrame
                 from ..data.resumable_loader import ResumableDataLoader
@@ -714,12 +747,13 @@ class IncrementalTrainer(CovariateTrainer):
             predictor = TimeSeriesPredictor(
                 target=self.config.get("target_col", "target"),
                 prediction_length=self.prediction_length,
+                known_covariates_names=known_covariates,
                 path=temp_model_path,
             )
             predictor.fit(
                 combined_data,
                 presets=self.training_preset,
-                excluded_model_types=["TemporalFusionTransformer"],
+                excluded_model_types=excluded,
             )
 
         return predictor

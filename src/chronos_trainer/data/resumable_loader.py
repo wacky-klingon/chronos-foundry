@@ -162,6 +162,15 @@ class ResumableDataLoader:
                 self.logger.warning(f"Parquet file is empty: {file_path}")
                 return None
 
+            # Drop date-string columns that carry no signal
+            date_cols = {"spread_10Y_2Y_date", "spread_10Y_3M_date"}
+            df = df.drop(columns=[c for c in date_cols if c in df.columns])
+
+            # Force numeric dtype on all feature columns to prevent AutoGluon silently dropping them
+            for col in df.columns:
+                if col not in ("ds", "item_id", "_year", "_month"):
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+
             # Add metadata columns
             df["_year"] = year
             df["_month"] = month

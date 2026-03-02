@@ -15,7 +15,7 @@ from chronos_trainer.training import (
     ChronosTrainer,
     CovariateTrainer,
     IncrementalTrainer,
-    CheckpointManager,
+    CheckpointManager
 )
 from chronos_trainer.data import (
     ResumableDataLoader,

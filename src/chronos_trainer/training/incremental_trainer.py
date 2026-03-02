@@ -4,6 +4,7 @@ Incremental trainer for continuous model improvement with versioning and rollbac
 
 import pandas as pd
 import numpy as np
+import traceback
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import logging
@@ -132,6 +133,7 @@ class IncrementalTrainer(CovariateTrainer):
                             "seasonal": "auto",
                         },
                     },
+                    excluded_model_types=["TemporalFusionTransformer"],
                 )
             else:
                 # Fresh training
@@ -157,6 +159,7 @@ class IncrementalTrainer(CovariateTrainer):
                             "seasonal": "auto",
                         },
                     },
+                    excluded_model_types=["TemporalFusionTransformer"],
                 )
 
             # Evaluate performance
@@ -227,7 +230,9 @@ class IncrementalTrainer(CovariateTrainer):
             }
 
         except Exception as e:
-            self.logger.error(f"Incremental training failed: {e}")
+            self.logger.error(
+                "Incremental training failed: %s\n%s", e, traceback.format_exc()
+            )
             raise IncrementalTrainingError(f"Incremental training failed: {e}") from e
 
     def _load_previous_model(self, model_path: str) -> TimeSeriesPredictor:
@@ -415,10 +420,9 @@ class IncrementalTrainer(CovariateTrainer):
             return performance
 
         except Exception as e:
-            self.logger.error(f"Failed to evaluate model performance: {e}")
-            import traceback
-
-            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            self.logger.error(
+                "Failed to evaluate model performance: %s\n%s", e, traceback.format_exc()
+            )
             return {
                 "mae": float("inf"),
                 "rmse": float("inf"),
@@ -599,7 +603,10 @@ class IncrementalTrainer(CovariateTrainer):
             }
 
         except Exception as e:
-            self.logger.error(f"Resumable training failed: {e}")
+            import traceback
+            self.logger.error(
+                "Resumable training failed: %s\n%s", e, traceback.format_exc()
+            )
             return {
                 "status": "error",
                 "message": f"Resumable training failed: {e}",
@@ -637,7 +644,9 @@ class IncrementalTrainer(CovariateTrainer):
             )
 
         except Exception as e:
-            self.logger.error(f"Failed to resume training: {e}")
+            self.logger.error(
+                "Failed to resume training: %s\n%s", e, traceback.format_exc()
+            )
             return {"status": "error", "message": f"Failed to resume training: {e}"}
 
     def _train_predictor(
@@ -673,7 +682,11 @@ class IncrementalTrainer(CovariateTrainer):
                 prediction_length=self.prediction_length,
                 path=temp_model_path,
             )
-            predictor.fit(ts_df, presets=self.training_preset)
+            predictor.fit(
+                ts_df,
+                presets=self.training_preset,
+                excluded_model_types=["TemporalFusionTransformer"],
+            )
         else:
             # Subsequent files - create new predictor and train on combined data
             # Load previous data and combine with current data
@@ -688,7 +701,10 @@ class IncrementalTrainer(CovariateTrainer):
                     previous_data, self.config
                 )
                 if previous_ts_df is not None:
-                    combined_data = pd.concat([previous_ts_df, ts_df], ignore_index=True)
+                    # Do NOT pass ignore_index=True — that replaces the (item_id, timestamp)
+                    # MultiIndex with a RangeIndex, causing AutoGluon to crash with
+                    # "'RangeIndex' object has no attribute 'codes'" on predictor.fit().
+                    combined_data = pd.concat([previous_ts_df, ts_df])
                 else:
                     combined_data = ts_df
             else:
@@ -700,7 +716,11 @@ class IncrementalTrainer(CovariateTrainer):
                 prediction_length=self.prediction_length,
                 path=temp_model_path,
             )
-            predictor.fit(combined_data, presets=self.training_preset)
+            predictor.fit(
+                combined_data,
+                presets=self.training_preset,
+                excluded_model_types=["TemporalFusionTransformer"],
+            )
 
         return predictor
 
@@ -740,7 +760,9 @@ class IncrementalTrainer(CovariateTrainer):
             )
 
         except Exception as e:
-            self.logger.error(f"Failed to load validation data: {e}")
+            self.logger.error(
+                "Failed to load validation data: %s\n%s", e, traceback.format_exc()
+            )
             return None
 
     def _load_previous_training_data(
@@ -775,7 +797,9 @@ class IncrementalTrainer(CovariateTrainer):
             return combined_df
 
         except Exception as e:
-            self.logger.warning(f"Failed to load previous training data: {e}")
+            self.logger.warning(
+                "Failed to load previous training data: %s\n%s", e, traceback.format_exc()
+            )
             return None
 
     def _save_final_model(
@@ -797,5 +821,7 @@ class IncrementalTrainer(CovariateTrainer):
             return model_path
 
         except Exception as e:
-            self.logger.error(f"Failed to save final model: {e}")
+            self.logger.error(
+                "Failed to save final model: %s\n%s", e, traceback.format_exc()
+            )
             return ""

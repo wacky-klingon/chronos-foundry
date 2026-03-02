@@ -44,8 +44,12 @@ class CovariateTrainer(ChronosTrainer):
         super().__init__(config)
         self.logger = logging.getLogger("covariate_trainer")
 
-        # Force CPU-only training
-        self._configure_cpu_training()
+        # Device is already resolved by ChronosTrainer.__init__ via _configure_device()
+        self.logger.info(
+            "CovariateTrainer initialised — device=%s model=%s",
+            self.device,
+            config.get("model_name", "<unknown>"),
+        )
 
         # Covariate-specific configuration
         self.covariate_config = config.get("covariates", {})
@@ -68,24 +72,6 @@ class CovariateTrainer(ChronosTrainer):
         self.available_covariates = []
         for columns in feature_columns.values():
             self.available_covariates.extend(columns)
-
-    def _configure_cpu_training(self) -> None:
-        """Configure environment for CPU-only training"""
-        try:
-            # Set environment variables to force CPU usage
-            os.environ["CUDA_VISIBLE_DEVICES"] = ""
-            os.environ["AUTOGLUON_DEVICE"] = "cpu"
-
-            # Additional environment variables for CPU-only training
-            os.environ["TORCH_DEVICE"] = "cpu"
-            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
-
-            self.logger.info("Configured environment for CPU-only training")
-            self.logger.info("CUDA_VISIBLE_DEVICES set to empty string")
-            self.logger.info("AUTOGLUON_DEVICE set to cpu")
-
-        except Exception as e:
-            self.logger.warning(f"Failed to configure CPU training environment: {e}")
 
     def prepare_timeseries_dataframe(self, df: pd.DataFrame) -> TimeSeriesDataFrame:
         """Convert pandas DataFrame to AutoGluon TimeSeriesDataFrame with covariate features"""
@@ -133,7 +119,13 @@ class CovariateTrainer(ChronosTrainer):
     def train_model(self, data: pd.DataFrame, model_save_path: str = None) -> str:
         """Train Chronos model on the provided data with covariate integration"""
         try:
-            self.logger.info("Starting covariate model training")
+            self.logger.info(
+                "Starting covariate model training — input rows=%d columns=%d device=%s",
+                len(data),
+                len(data.columns),
+                self.device,
+            )
+            self.logger.debug("Input columns: %s", list(data.columns))
 
             # Convert to TimeSeriesDataFrame with covariates
             ts_data = self.prepare_timeseries_dataframe(data)
@@ -145,9 +137,13 @@ class CovariateTrainer(ChronosTrainer):
                 eval_metric="MASE",
             )
 
-            # Train the model with covariate integration
             self.logger.info(
-                "Training with %d records and covariate features", len(ts_data)
+                "Predictor created — prediction_length=%d eval_metric=MASE preset=%s",
+                self.prediction_length,
+                self.training_preset,
+            )
+            self.logger.info(
+                "Fitting on %d TimeSeriesDataFrame records", len(ts_data)
             )
 
             # Get available covariate columns for training
@@ -155,42 +151,45 @@ class CovariateTrainer(ChronosTrainer):
                 col for col in self.available_covariates if col in ts_data.columns
             ]
 
+            chronos_hyperparams: Dict[str, Any] = {
+                "model_path": self.model_name,
+                "context_length": self.context_length,
+                "learning_rate": self.learning_rate,
+                "batch_size": self.batch_size,
+                "max_epochs": self.max_epochs,
+                "device": self.device,
+            }
+
+            self.logger.info(
+                "Chronos hyperparameters: context_length=%d prediction_length=%d "
+                "batch_size=%d max_epochs=%d learning_rate=%s device=%s",
+                self.context_length,
+                self.prediction_length,
+                self.batch_size,
+                self.max_epochs,
+                self.learning_rate,
+                self.device,
+            )
+
             if covariate_columns:
-                self.logger.info("Using covariate features: %s", covariate_columns)
-                # AutoGluon will automatically use these as known covariates
+                self.logger.info(
+                    "Fitting with %d covariate feature(s): %s",
+                    len(covariate_columns),
+                    covariate_columns,
+                )
                 self.predictor.fit(
                     ts_data,
                     presets=self.training_preset,
-                    hyperparameters={
-                        "Chronos": {
-                            "model_path": self.model_name,
-                            "context_length": self.context_length,
-                            "learning_rate": self.learning_rate,
-                            "batch_size": self.batch_size,
-                            "max_epochs": self.max_epochs,
-                            "device": "cpu",  # Force CPU device
-                            "torch_device": "cpu",  # Additional CPU enforcement
-                        }
-                    },
+                    hyperparameters={"Chronos": chronos_hyperparams},
                 )
             else:
                 self.logger.warning(
-                    "No covariate features available, training without covariates"
+                    "No covariate features available — training without covariates"
                 )
                 self.predictor.fit(
                     ts_data,
                     presets=self.training_preset,
-                    hyperparameters={
-                        "Chronos": {
-                            "model_path": self.model_name,
-                            "context_length": self.context_length,
-                            "learning_rate": self.learning_rate,
-                            "batch_size": self.batch_size,
-                            "max_epochs": self.max_epochs,
-                            "device": "cpu",  # Force CPU device
-                            "torch_device": "cpu",  # Additional CPU enforcement
-                        }
-                    },
+                    hyperparameters={"Chronos": chronos_hyperparams},
                 )
 
             # Save the model

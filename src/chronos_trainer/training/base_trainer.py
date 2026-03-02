@@ -18,6 +18,12 @@ except ImportError as e:
     logger.error(f"AutoGluon import error: {e}")
     logger.error("Please install autogluon: pip install autogluon")
 
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
+
 
 class TrainingError(Exception):
     """Raised when model training fails"""
@@ -32,8 +38,9 @@ class ChronosTrainer:
         self.config = config
         self.logger = logging.getLogger("model_trainer")
 
-        # Force CPU-only training
-        self._configure_cpu_training()
+        # Resolve and configure compute device
+        self.device: str = "cpu"
+        self._configure_device()
 
         # Extract training configuration - NO DEFAULTS, FAIL FAST
         self.model_name = config["model_name"]
@@ -46,23 +53,84 @@ class ChronosTrainer:
         self.predictor = None
         self.model_path = None
 
-    def _configure_cpu_training(self) -> None:
-        """Configure environment for CPU-only training"""
-        try:
-            # Set environment variables to force CPU usage
-            os.environ["CUDA_VISIBLE_DEVICES"] = ""
-            os.environ["AUTOGLUON_DEVICE"] = "cpu"
+    def _apply_cpu_env(self) -> None:
+        """Set environment variables that force all frameworks to CPU."""
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        os.environ["AUTOGLUON_DEVICE"] = "cpu"
+        os.environ["TORCH_DEVICE"] = "cpu"
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+        self.logger.info("CPU-only environment variables applied")
+        self.logger.debug(
+            "CUDA_VISIBLE_DEVICES='', AUTOGLUON_DEVICE=cpu, TORCH_DEVICE=cpu"
+        )
 
-            # Additional environment variables for CPU-only training
-            os.environ["TORCH_DEVICE"] = "cpu"
-            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+    def _configure_device(self) -> None:
+        """Resolve the compute device from config and configure the environment.
 
-            self.logger.info("Configured environment for CPU-only training")
-            self.logger.info("CUDA_VISIBLE_DEVICES set to empty string")
-            self.logger.info("AUTOGLUON_DEVICE set to cpu")
+        Supports three values for config key ``device``:
+        - ``"cpu"``  (default) — forces all frameworks to CPU.
+        - ``"cuda"`` — requires CUDA; raises TrainingError if unavailable.
+        - ``"auto"`` — uses CUDA when available, falls back to CPU silently.
+        """
+        requested: str = self.config.get("device", "cpu")
+        self.logger.info("Requested training device: %s", requested)
 
-        except Exception as e:
-            self.logger.warning(f"Failed to configure CPU training environment: {e}")
+        if requested in ("cuda", "auto"):
+            if not _TORCH_AVAILABLE:
+                if requested == "cuda":
+                    raise TrainingError(
+                        "device='cuda' requested but PyTorch is not installed"
+                    )
+                self.logger.warning(
+                    "PyTorch not available; cannot detect CUDA — falling back to CPU"
+                )
+                self.device = "cpu"
+                self._apply_cpu_env()
+                return
+
+            cuda_available = torch.cuda.is_available()
+            self.logger.debug("torch.cuda.is_available() = %s", cuda_available)
+
+            if cuda_available:
+                device_count = torch.cuda.device_count()
+                device_name = torch.cuda.get_device_name(0)
+                props = torch.cuda.get_device_properties(0)
+                vram_total_gb = props.total_memory / (1024 ** 3)
+                compute_capability = f"{props.major}.{props.minor}"
+
+                self.device = "cuda"
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                os.environ["AUTOGLUON_DEVICE"] = "gpu"
+                os.environ["TORCH_DEVICE"] = "cuda"
+
+                self.logger.info(
+                    "CUDA available — %d device(s) detected", device_count
+                )
+                self.logger.info(
+                    "GPU 0: %s | VRAM: %.1f GB | Compute capability: %s",
+                    device_name,
+                    vram_total_gb,
+                    compute_capability,
+                )
+                self.logger.info(
+                    "AUTOGLUON_DEVICE=gpu, TORCH_DEVICE=cuda"
+                )
+            else:
+                if requested == "cuda":
+                    raise TrainingError(
+                        "device='cuda' requested but torch.cuda.is_available() is False. "
+                        "Verify CUDA drivers and PyTorch CUDA build on this instance."
+                    )
+                self.logger.warning(
+                    "device='auto' requested but CUDA is not available — falling back to CPU"
+                )
+                self.device = "cpu"
+                self._apply_cpu_env()
+        else:
+            self.device = "cpu"
+            self._apply_cpu_env()
+
+        self.logger.info("Training device resolved to: %s", self.device)
 
     def prepare_timeseries_dataframe(self, df: pd.DataFrame) -> TimeSeriesDataFrame:
         """Convert pandas DataFrame to AutoGluon TimeSeriesDataFrame"""
@@ -111,11 +179,13 @@ class ChronosTrainer:
             # Train the model
             self.logger.info(f"Training with {len(ts_data)} records")
 
+            self.logger.info(
+                "Fitting predictor on %d records using device=%s", len(ts_data), self.device
+            )
             self.predictor.fit(
                 ts_data,
-                presets="high_quality",  # CPU-compatible preset for large datasets
+                presets="high_quality",
                 hyperparameters={
-                    # CPU-compatible models for 20+ years of data
                     "ARIMA": {
                         "order": (2, 1, 2),  # More complex ARIMA
                         "seasonal_order": (1, 1, 1, 12),  # Seasonal patterns

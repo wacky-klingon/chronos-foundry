@@ -231,8 +231,8 @@ xargs -I {} aws ec2 delete-snapshot --snapshot-id {}
       },
       "deployed": true,
       "deployed_at": "2024-03-16T10:00:00Z",
-      "model_path": "s3://bucket/phase1/2024/03/15-143022/models/",
-      "metadata_path": "s3://bucket/phase1/2024/03/15-143022/model_metadata.json"
+      "model_path": "s3://bucket/{env}/2024/03/15-143022/models/",
+      "metadata_path": "s3://bucket/{env}/2024/03/15-143022/model_metadata.json"
     }
   ],
   "latest_deployment": {
@@ -444,12 +444,12 @@ dashboard.addWidgets(
 
 **Current MVP:** Single lifecycle rule
 ```
-phase1/* → Intelligent-Tiering at day 7 → Glacier at day 30 → Delete at day 60
+{env}/* → Intelligent-Tiering at day 7 → Glacier at day 30 → Delete at day 60
 ```
 
 **Enhancement:** Granular lifecycle rules per data type
-- `phase1/logs/` → IA at day 7 → Delete at day 14
-- `phase1/models/` → IA at day 7 → Glacier at day 30 → Delete at day 60
+- `{env}/logs/` → IA at day 7 → Delete at day 14
+- `{env}/models/` → IA at day 7 → Glacier at day 30 → Delete at day 60
 - `runtime/python-env/` → IA at day 30 → Delete at day 90
 
 **Why deferred:**
@@ -491,7 +491,7 @@ cat logs/* | awk '{print $8}' | sort | uniq -c | sort -rn | head -20
 bucket.addLifecycleRule({
   id: 'HotModelArtifacts',
   enabled: true,
-  prefix: 'phase1/models/',
+  prefix: '{env}/models/',
   transitions: [
     {
       storageClass: s3.StorageClass.INTELLIGENT_TIERING,
@@ -504,7 +504,7 @@ bucket.addLifecycleRule({
 bucket.addLifecycleRule({
   id: 'ColdLogs',
   enabled: true,
-  prefix: 'phase1/logs/',
+  prefix: '{env}/logs/',
   transitions: [
     {
       storageClass: s3.StorageClass.INFREQUENT_ACCESS,
@@ -709,5 +709,5 @@ When implementing Phase 2 features:
 ## Related Documentation
 
 - [AWS Documentation Index](../aws/index.md) - Documentation overview
-- [Requirements](requirements.md) - MVP requirements
+- [Overview](overview.md) - MVP capabilities
 - [State Machine](state-machine.md) - State management and error handling

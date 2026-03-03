@@ -6,6 +6,7 @@ with integration to CheckpointManager for resumable training workflows.
 """
 
 import pandas as pd
+import numpy as np
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 from datetime import datetime, timedelta
@@ -41,6 +42,8 @@ class ResumableDataLoader:
 
         self.checkpoint_manager = checkpoint_manager
         self.logger = logging.getLogger(__name__)
+        # Cache normalized per-file DataFrames to avoid repeated parquet re-reads.
+        self._df_cache: Dict[str, pd.DataFrame] = {}
 
     def get_parquet_files(
         self, start_date: str, end_date: str
@@ -155,6 +158,11 @@ class ResumableDataLoader:
                 self.logger.error(f"Parquet file does not exist: {file_path}")
                 return None
 
+            cache_key = str(parquet_path.resolve())
+            if cache_key in self._df_cache:
+                # Return a copy so downstream mutations do not affect cache contents.
+                return self._df_cache[cache_key].copy()
+
             # Load parquet file
             df = pd.read_parquet(parquet_path)
 
@@ -166,15 +174,26 @@ class ResumableDataLoader:
             date_cols = {"spread_10Y_2Y_date", "spread_10Y_3M_date"}
             df = df.drop(columns=[c for c in date_cols if c in df.columns])
 
-            # Force numeric dtype on all feature columns to prevent AutoGluon silently dropping them
-            for col in df.columns:
-                if col not in ("ds", "item_id", "_year", "_month"):
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            # Force numeric dtype on all feature columns to prevent AutoGluon silently dropping them.
+            feature_cols = [
+                col for col in df.columns if col not in ("ds", "item_id", "_year", "_month")
+            ]
+            if feature_cols:
+                df[feature_cols] = df[feature_cols].apply(pd.to_numeric, errors="coerce")
+
+            # Keep float features contiguous float32 to reduce memory bandwidth pressure.
+            float_cols = df.select_dtypes(include=["float32", "float64"]).columns.tolist()
+            if float_cols:
+                contiguous_float_data = np.ascontiguousarray(
+                    df[float_cols].to_numpy(dtype=np.float32, copy=False)
+                )
+                df[float_cols] = contiguous_float_data
 
             # Add metadata columns
             df["_year"] = year
             df["_month"] = month
 
+            self._df_cache[cache_key] = df.copy()
             self.logger.debug(f"Loaded {len(df)} records from {file_path}")
             return df
 

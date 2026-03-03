@@ -201,38 +201,16 @@ def test_training_performance(benchmark):
 
 ## Updating S3 Data (Admin Task)
 
-When you generate new configs or cached datasets, upload them to S3:
+For S3 upload procedures (cached datasets, configs), see [Updating S3 Data](usage-guide.md#updating-s3-data-admin-task) in the Usage Guide.
 
-```bash
-# Use admin credentials (trainer-runtime has read-only access)
-export AWS_PROFILE=admin
-export BUCKET_NAME=YOUR-BUCKET-NAME  # or get from CloudFormation exports
+## Test Coverage TODO (Remaining)
 
-# Upload new cached datasets (replace LOCAL_DATA_PATH with your local path)
-aws s3 rm s3://${BUCKET_NAME}/cached-datasets/training-data/ --recursive
-aws s3 sync LOCAL_DATA_PATH \
-    s3://${BUCKET_NAME}/cached-datasets/training-data/ \
-    --exclude "*.tmp" \
-    --exclude "*.log" \
-    --exclude "__pycache__/*" \
-    --exclude "*.pyc" \
-    --profile admin
+Phase 1 complete. Remaining items for full API coverage:
 
-# Upload new config files (navigate to your project directory first)
-cd your-project
-aws s3 rm s3://${BUCKET_NAME}/cached-datasets/configs/ --recursive
-aws s3 cp config/parquet_loader_config.ec2.yaml \
-    s3://${BUCKET_NAME}/cached-datasets/configs/parquet_loader_config.yaml \
-    --profile admin
-aws s3 cp config/train.ec2.yaml \
-    s3://${BUCKET_NAME}/cached-datasets/configs/train.yaml \
-    --profile admin
+- **Phase 2 (Medium)**: test_training_progress (CheckpointManager.get_training_progress); test_resumable_loader_remaining_files
+- **Phase 3 (Low)**: test_checkpoint_cleanup; test_resumable_loader_data_stats
 
-# Verify uploads
-aws s3 ls s3://${BUCKET_NAME}/cached-datasets/configs/ --profile admin
-```
-
-**Note**: This is an admin-only task. The `trainer-runtime` user has read-only S3 access.
+Create GitHub Issues for tracking. Target: full coverage of public APIs.
 
 ## Additional Resources
 

@@ -4,7 +4,7 @@ This section contains development and internal documentation for contributors an
 
 ## Documentation
 
-- **[Test Coverage TODO](test-coverage-todo.md)** - Planned tests to implement for full API coverage
+- **[Test Coverage TODO](../user-guides/testing.md#test-coverage-todo-remaining)** - Remaining tests to implement (in Testing Guide)
 
 ## Purpose
 

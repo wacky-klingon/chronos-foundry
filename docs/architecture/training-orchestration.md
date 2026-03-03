@@ -35,12 +35,6 @@ graph TB
         L[EBS Volume]
     end
 
-    subgraph "AWS Resources"
-        M[NAT Gateway]
-        N[Elastic IP]
-        O[EBS Snapshots]
-    end
-
     A -->|Launch| I
     A -->|Check State| G
     B -->|Monitor| G
@@ -50,13 +44,9 @@ graph TB
     I -->|Sync Data| E
     I -->|Update State| G
     I -->|Store Results| F
-    I -->|Create Snapshots| O
-    J -->|Cleanup Resources| M
-    J -->|Cleanup Resources| N
-    J -->|Update Registry| H
+    J -->|Cleanup| G
 
     K -->|Read/Write| L
-    L -->|Snapshot| O
 
     style A fill:#e1f5fe
     style E fill:#f3e5f5
@@ -81,10 +71,9 @@ flowchart TD
     I --> J[Run training]
     J --> K[Sync results to S3]
     K --> L[cleanup.sh]
-    L --> M[Create snapshots]
-    M --> N[Delete resources]
-    N --> O[Update state file]
-    O --> P[Terminate instance]
+    L --> M[Delete resources]
+    M --> N[Update state file]
+    N --> O[Terminate instance]
 
     Q[monitor_training.sh] --> R[Read state file]
     R --> S[Display progress]
@@ -113,24 +102,7 @@ stateDiagram-v2
     ResultsSync --> SelfTerminate: Sync Complete
 ```
 
-### EC2 Instance Lifecycle
-
-```mermaid
-stateDiagram-v2
-    [*] --> Launching: Dev Machine Trigger
-    Launching --> Initializing: Instance Ready
-    Initializing --> DataSync: Setup Complete
-    DataSync --> Training: Data Ready
-    Training --> Logging: Training Active
-    Logging --> Training: Continue
-    Training --> ResultsSync: Training Complete
-    ResultsSync --> SelfTerminate: Sync Complete
-    SelfTerminate --> [*]: Instance Terminated
-
-    Training --> ErrorHandling: Training Failed
-    ErrorHandling --> ResultsSync: Capture Errors
-    ResultsSync --> SelfTerminate: Sync Complete
-```
+For canonical state transitions and error handling, see [State Machine](state-machine.md).
 
 ## EC2 Instance Management
 
@@ -190,13 +162,15 @@ The system implements security through VPC configuration, security groups, and I
 
 **Idle Cost**: $0/month (VPC, IGW, S3 endpoint all free)
 
-**IAM Roles**: Least privilege with S3 read-only (cached datasets), S3 read-write (phase1 outputs), EC2 self-termination only.
+**IAM Roles**: Least privilege with S3 read-only (cached datasets), S3 read-write ({env} outputs), EC2 self-termination only.
 
 **Note**: Private subnet with ephemeral NAT Gateway available in Phase 2 for compliance scenarios (see [Future Enhancements](future-enhancements.md)).
 
 ## S3 Data Flow and Storage
 
 ### S3 Bucket Structure
+
+See [System Architecture](system-architecture.md) for the canonical S3 layout and Design FAQ. Summary:
 
 ```
 s3://chronos-training-{account}-{region}/
@@ -748,7 +722,7 @@ For detailed state management implementation, see the [CDK Implementation Guide]
 
 - [CDK Implementation Guide](cdk-implementation.md) - Complete infrastructure setup and state management
 - [Usage Guide](../user-guides/usage-guide.md) - Complete usage instructions and troubleshooting
-- [Requirements](requirements.md) - Functional and non-functional requirements (includes user acceptance criteria)
+- [Overview](overview.md) - MVP capabilities and user epics
 
 ## Future Enhancements
 

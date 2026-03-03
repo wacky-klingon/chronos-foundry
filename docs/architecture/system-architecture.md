@@ -509,6 +509,28 @@ aws s3 cp s3://bucket/dev/$RUN_ID/training.json - | jq .
 - Set up alarms for long-running instances (> 4 hours)
 - Log groups for structured logging (requires CloudWatch agent)
 
+## Design FAQ
+
+Design-phase Q&A for S3 sync and data flow:
+
+**Local vs S3 path mapping:**
+- Local Dev: `LOCAL_DATA_PATH/` -> S3: `s3://bucket/cached-datasets/training-data/`
+- EC2 Training: `/data/` (synced from S3) <- S3: `s3://bucket/cached-datasets/training-data/`
+- EC2 Configs: `/opt/heisenberg-engine/config/` <- S3: `s3://bucket/cached-datasets/configs/`
+- EC2 Outputs: `/data/output/` -> S3: `s3://bucket/{env}/{run_id}/`
+
+**Sync direction:** Cached datasets S3 -> Local only (read-only). Logs, models, checkpoints: Local -> S3 (push at end of training).
+
+**Sync triggers:** Start of training (pull), end of training (push). No periodic sync.
+
+**Conflict resolution:** EC2 files take precedence. Local overwrites S3 for logs/models/checkpoints.
+
+**File types:** Cached datasets: Parquet only. Models: Pickle, JSON metadata. Checkpoints: JSON, model files.
+
+**Multiple instances:** Single instance only. No locking; one process at a time.
+
+**Security:** IAM roles (KISS), encryption at rest, no S3 versioning for MVP.
+
 ## Next Steps
 
 - Read [CDK Implementation Guide](cdk-implementation.md) for CDK deployment details

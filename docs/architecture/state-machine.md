@@ -12,7 +12,7 @@ This document is the **single source of truth** for state management, error hand
 
 ### Location
 
-`s3://bucket/phase1/system-state.json`
+`s3://bucket/{env}/system-state.json`
 
 **Atomic Write Pattern**: Always write to `system-state.tmp`, then `aws s3 mv` to `system-state.json`. This ensures atomic updates visible to monitoring scripts.
 
@@ -176,7 +176,7 @@ done
 if ! check_preconditions; then
   ERROR_MSG="Precondition failed: IAM permissions"
   echo "{\"error\": \"$ERROR_MSG\", \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > /tmp/logs/preflight.json
-  aws s3 cp /tmp/logs/preflight.json s3://bucket/phase1/logs/${RUN_ID}/preflight.json
+  aws s3 cp /tmp/logs/preflight.json s3://bucket/{env}/logs/${RUN_ID}/preflight.json
   update_state_file "status=failed" "error_message=$ERROR_MSG"
   trigger_cleanup
   exit 1
@@ -219,7 +219,7 @@ cleanup_nat_gateway() {
 
 ## Required Artifacts (MVP - 3 Files)
 
-Every training run **must** produce these JSON artifacts uploaded to `s3://bucket/phase1/logs/<run_id>/`:
+Every training run **must** produce these JSON artifacts uploaded to `s3://bucket/{env}/logs/<run_id>/`:
 
 **MVP Simplification**: Reduced from 5 detailed phase logs to 3 essential files. Granular phase tracking (preflight, data_sync, results_sync) is incorporated into `training.json`. Advanced per-phase artifacts can be added in Phase 2 if needed.
 
@@ -324,7 +324,7 @@ cat > /tmp/cleanup_status.tmp <<EOF
   ...
 }
 EOF
-aws s3 cp /tmp/cleanup_status.tmp s3://bucket/phase1/logs/${RUN_ID}/cleanup_status.json
+aws s3 cp /tmp/cleanup_status.tmp s3://bucket/{env}/logs/${RUN_ID}/cleanup_status.json
 ```
 
 ## Idempotent Cleanup Contract
@@ -398,7 +398,7 @@ After cleanup completes, the `verify_cleanup.sh` script can be run to ensure no 
 |-----------------|----------------------------------------------|-------------------|----------------|
 | EC2 Instance    | `aws ec2 describe-instances --filters`       | $1-2/hour         | Critical (5 min)|
 | EBS Volumes     | `aws ec2 describe-volumes --filters`         | $0.01/hour        | Low (auto-deleted with DeleteOnTermination=true) |
-| State File      | `aws s3 ls s3://bucket/phase1/system-state.json` | None         | Low            |
+| State File      | `aws s3 ls s3://bucket/{env}/system-state.json` | None         | Low            |
 
 **MVP Note**: No NAT Gateway, Elastic IP, or EBS snapshots to verify. System uses public subnet approach with minimal cleanup complexity.
 

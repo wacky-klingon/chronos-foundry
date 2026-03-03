@@ -6,7 +6,7 @@ This section contains design documents, architecture decisions, and implementati
 
 - **[Overview](overview.md)** - Unified system overview and design principles
 - **[System Architecture](system-architecture.md)** - Detailed architecture, design principles, and data flow
-- **[Requirements](requirements.md)** - Functional and non-functional requirements
+- **[Overview](overview.md)** - MVP capabilities and user epics
 - **[Training Orchestration](training-orchestration.md)** - EC2 training orchestration workflow
 - **[State Machine](state-machine.md)** - State management and transitions
 - **[CDK Implementation](cdk-implementation.md)** - AWS CDK infrastructure implementation guide
@@ -17,7 +17,7 @@ This section contains design documents, architecture decisions, and implementati
 ### For System Understanding
 1. Start with [Overview](overview.md) for high-level design
 2. Read [System Architecture](system-architecture.md) for detailed design
-3. Review [Requirements](requirements.md) for functional specifications
+3. Review [Overview](overview.md) for functional specifications
 
 ### For Implementation
 1. Read [Training Orchestration](training-orchestration.md) for workflow details

@@ -2,6 +2,19 @@
 
 Complete guide to implementing custom time series trainers using the Chronos Foundry framework.
 
+## Quick Reference
+
+| Topic | Section |
+|-------|---------|
+| Minimal 5-min walkthrough | [Quick Example](../getting-started/quick-example.md) |
+| Configuration | [Configuration](#configuration) |
+| Custom trainers | [Creating Custom Trainers](#creating-custom-trainers) |
+| Data loading | [Data Loading](#data-loading) |
+| Training workflow | [Training Workflow](#training-workflow) |
+| Model management | [Model Management](#model-management) |
+| AWS deployment | [AWS Deployment](#aws-deployment) |
+| Best practices | [Best Practices](#best-practices) |
+
 ## Table of Contents
 
 - [Quick Start](#quick-start)
@@ -16,6 +29,8 @@ Complete guide to implementing custom time series trainers using the Chronos Fou
 ---
 
 ## Quick Start
+
+For a minimal 5-minute walkthrough, see [Quick Example](../getting-started/quick-example.md).
 
 ### 1. Installation
 
@@ -525,78 +540,7 @@ print(f"Test RMSE: {metrics['rmse']:.4f}")
 
 ## AWS Deployment
 
-### Setup AWS Infrastructure
-
-```bash
-# 1. Clone repository for AWS reference
-git clone https://github.com/yourusername/chronos-foundry.git
-cd chronos-foundry
-
-# 2. Configure environment (in aws/cdk directory)
-cd aws/cdk
-cp .env.example .env
-
-# Edit .env with your settings:
-# S3_BUCKET_NAME=your-bucket-name
-# CDK_ENVIRONMENT=dev
-# PROJECT_NAME=Chronos-Training
-# COST_CENTER=train
-```
-
-### Deploy Infrastructure
-
-```bash
-cd aws/cdk
-
-# Install dependencies
-npm install
-
-# Bootstrap CDK (first time only)
-cdk bootstrap
-
-# Deploy stack
-cdk deploy
-
-# Outputs:
-# - S3 bucket name
-# - IAM role ARN
-# - Security group ID
-```
-
-### Launch Training Job
-
-```bash
-cd aws/scripts
-
-# Launch training on EC2
-./launch_training.sh
-
-# Output:
-# Instance ID: i-1234567890abcdef0
-# State file: s3://your-bucket/state/training_TIMESTAMP.json
-```
-
-### Monitor Training
-
-```bash
-# Watch training progress
-./monitor_training.sh
-
-# Shows:
-# - Instance status
-# - Training progress
-# - Logs and metrics
-# - Estimated completion
-```
-
-### Emergency Stop
-
-```bash
-# Kill running training job
-./kill_training.sh
-
-# Confirms termination and cleans up resources
-```
+Deploy CDK infrastructure, upload training data, then run `launch_training.sh`, `monitor_training.sh`, and `kill_training.sh` as needed. For the full 5-step walkthrough, see [AWS Quickstart](../getting-started/aws-quickstart.md).
 
 ---
 

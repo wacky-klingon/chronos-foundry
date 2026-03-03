@@ -16,7 +16,7 @@ Welcome to the Chronos Foundry documentation. This library provides production-g
 - **Architecture** - System design and implementation
   - [Overview](architecture/overview.md) - System overview
   - [System Architecture](architecture/system-architecture.md) - Design principles and architecture
-  - [Requirements](architecture/requirements.md) - Functional requirements
+  - [Overview](architecture/overview.md) - MVP capabilities
   - [Training Orchestration](architecture/training-orchestration.md) - EC2 orchestration details
   - [State Machine](architecture/state-machine.md) - State management
   - [CDK Implementation](architecture/cdk-implementation.md) - Infrastructure as code
@@ -26,18 +26,7 @@ Welcome to the Chronos Foundry documentation. This library provides production-g
   - [AWS Documentation Index](aws/index.md) - AWS documentation navigation
 
 - **Internal** - Development documentation
-  - [Test Coverage TODO](internal/test-coverage-todo.md) - Test implementation roadmap
-
-## Documentation Structure
-
-All documentation is organized by audience and purpose:
-
-- **Getting Started** - Quick tutorials for new users
-- **User Guides** - Detailed guides for using the library
-- **Architecture** - Design documents and implementation details
-- **AWS Reference** - AWS infrastructure and deployment guides
-- **API** - API reference (coming soon)
-- **Internal** - Development and contribution guides
+  - [Test Coverage TODO](user-guides/testing.md#test-coverage-todo-remaining) - Remaining tests to implement
 
 ## Project README
 

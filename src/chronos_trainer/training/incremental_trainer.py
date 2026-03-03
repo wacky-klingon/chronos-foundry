@@ -2,9 +2,12 @@
 Incremental trainer for continuous model improvement with versioning and rollback
 """
 
+import json
 import pandas as pd
 import numpy as np
+import shutil
 import traceback
+import time
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import logging
@@ -56,6 +59,40 @@ class IncrementalTrainer(CovariateTrainer):
             "max_versions": self.incremental_config.get("max_versions", 10),
         }
         self.versioning = ModelVersioning(versioning_config)
+        self._resumable_loader: Optional[Any] = None
+
+    def _ensure_path_available(
+        self,
+        path_value: Optional[str],
+        path_name: str = "path",
+    ) -> Path:
+        """
+        Ensure a path is configured, exists (or can be created), and has sufficient disk space.
+        Raises IncrementalTrainingError if not available.
+        """
+        if not path_value or not str(path_value).strip():
+            raise IncrementalTrainingError(
+                f"{path_name} is required. Pass --{path_name.replace('_', '-')} or set in config."
+            )
+        path = Path(path_value).resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        min_bytes = self.incremental_config.get("min_free_bytes", 1024**3)  # 1GB
+        usage = shutil.disk_usage(path)
+        self.logger.info(
+            "%s: %s, free space: %s bytes",
+            path_name,
+            path,
+            usage.free,
+        )
+        if usage.free < min_bytes:
+            raise IncrementalTrainingError(
+                f"Insufficient disk space on {path}: {usage.free} free, required >= {min_bytes}"
+            )
+        return path
+
+    def _ensure_model_path_available(self, model_path: Optional[str]) -> Path:
+        """Ensure model_path is configured and available. Raises if not."""
+        return self._ensure_path_available(model_path, "model_path")
 
     def train_incremental(
         self,
@@ -75,6 +112,7 @@ class IncrementalTrainer(CovariateTrainer):
             Dictionary with training results, version info, and performance metrics
         """
         try:
+            self._ensure_model_path_available(self.config.get("model_path"))
             self.logger.info(
                 f"Starting incremental training for date range: {date_range[0]} to {date_range[1]}"
             )
@@ -326,7 +364,16 @@ class IncrementalTrainer(CovariateTrainer):
 
             # Generate predictions for evaluation
             self.logger.info("Generating predictions...")
-            predictions = predictor.predict(train_data)
+            known_covariates_names = self.incremental_config.get("known_covariates", [])
+            if known_covariates_names and all(
+                c in val_data.columns for c in known_covariates_names
+            ):
+                known_cov_df = val_data[known_covariates_names]
+                predictions = predictor.predict(
+                    train_data, known_covariates=known_cov_df
+                )
+            else:
+                predictions = predictor.predict(train_data)
 
             self.logger.info(f"Predictions type: {type(predictions)}")
             self.logger.info(f"Predictions shape: {predictions.shape}")
@@ -466,7 +513,11 @@ class IncrementalTrainer(CovariateTrainer):
             Training results dictionary
         """
         try:
+            model_path = self._ensure_model_path_available(self.config.get("model_path"))
+            self._ensure_path_available(checkpoint_dir, "checkpoint_dir")
             self.logger.info(f"Starting resumable training: {start_date} to {end_date}")
+            epoch_start_time = time.perf_counter()
+            file_timing_rows: List[Dict[str, Any]] = []
 
             # Initialize checkpoint manager
             checkpoint_manager = CheckpointManager(checkpoint_dir)
@@ -499,12 +550,8 @@ class IncrementalTrainer(CovariateTrainer):
                     "total_files": 0,
                 }
 
-            # Import resumable loader
-            from ..data.resumable_loader import ResumableDataLoader
-
             # Initialize resumable loader
-            base_data_path = ConfigHelpers.get_parquet_root_dir(self.config)
-            resumable_loader = ResumableDataLoader(base_data_path, checkpoint_manager)
+            resumable_loader = self._get_resumable_loader(checkpoint_manager)
 
             # Get remaining files to process
             remaining_files = resumable_loader.get_remaining_files(start_date, end_date)
@@ -521,24 +568,34 @@ class IncrementalTrainer(CovariateTrainer):
             # Process each remaining file
             for file_path, year, month in remaining_files:
                 self.logger.info(f"Processing file: {year:04d}-{month:02d}")
+                file_start_time = time.perf_counter()
 
                 # Load parquet file
+                parquet_load_start_time = time.perf_counter()
                 df = resumable_loader.load_parquet_file(file_path, year, month)
+                parquet_load_time_s = time.perf_counter() - parquet_load_start_time
                 if df is None:
                     self.logger.error(f"Failed to load file: {file_path}")
                     continue
 
                 # Convert to TimeSeriesDataFrame
+                ts_convert_start_time = time.perf_counter()
                 ts_df = resumable_loader.convert_to_timeseries_dataframe(
                     df, self.config
                 )
+                ts_convert_time_s = time.perf_counter() - ts_convert_start_time
                 if ts_df is None:
                     self.logger.error(f"Failed to convert file: {file_path}")
                     continue
 
                 # Train model incrementally
-                predictor = self._train_predictor(
-                    predictor, ts_df, year, month, training_state["processed_files"]
+                predictor, train_time_s = self._train_predictor(
+                    predictor,
+                    ts_df,
+                    year,
+                    month,
+                    training_state["processed_files"],
+                    checkpoint_dir=checkpoint_dir,
                 )
 
                 # Get data stats
@@ -569,6 +626,26 @@ class IncrementalTrainer(CovariateTrainer):
                         "checkpoint_dir": checkpoint_dir,
                     }
 
+                file_total_time_s = time.perf_counter() - file_start_time
+                file_timing_rows.append(
+                    {
+                        "year": year,
+                        "month": month,
+                        "parquet_load_time_s": parquet_load_time_s,
+                        "timeseries_convert_time_s": ts_convert_time_s,
+                        "fit_time_s": train_time_s,
+                        "file_total_time_s": file_total_time_s,
+                    }
+                )
+                self.logger.info(
+                    "Timing %04d-%02d | parquet=%.3fs convert=%.3fs fit=%.3fs total=%.3fs",
+                    year,
+                    month,
+                    parquet_load_time_s,
+                    ts_convert_time_s,
+                    train_time_s,
+                    file_total_time_s,
+                )
                 self.logger.info(f"Checkpoint saved for {year:04d}-{month:02d}")
 
             # Final validation on unseen data
@@ -590,7 +667,21 @@ class IncrementalTrainer(CovariateTrainer):
                 }
 
             # Save final model
-            final_model_path = self._save_final_model(predictor, start_date, end_date)
+            pf = training_state["processed_files"]
+            last = pf[-1] if pf else None
+            final_model_path = self._save_final_model(
+                model_path,
+                predictor,
+                start_date,
+                end_date,
+                performance=performance,
+                checkpoint_dir=checkpoint_dir,
+                last_year=last["year"] if last else None,
+                last_month=last["month"] if last else None,
+            )
+
+            epoch_time_s = time.perf_counter() - epoch_start_time
+            self.logger.info("Total epoch time: %.3fs", epoch_time_s)
 
             return {
                 "status": "completed",
@@ -600,6 +691,14 @@ class IncrementalTrainer(CovariateTrainer):
                 "performance": performance,
                 "processed_files": len(training_state["processed_files"]),
                 "total_files": training_state["total_files"],
+                "timing": {
+                    "epoch_time_s": epoch_time_s,
+                    "files": file_timing_rows,
+                    "batch_load_time_s": "n/a (internal AutoGluon DataLoader)",
+                    "forward_pass_time_s": "n/a (internal AutoGluon trainer)",
+                    "backward_pass_time_s": "n/a (internal AutoGluon trainer)",
+                    "optimizer_step_time_s": "n/a (internal AutoGluon trainer)",
+                },
             }
 
         except Exception as e:
@@ -656,7 +755,9 @@ class IncrementalTrainer(CovariateTrainer):
         year: int,
         month: int,
         processed_files: List[Dict[str, Any]],
-    ) -> TimeSeriesPredictor:
+        *,
+        checkpoint_dir: str,
+    ) -> Tuple[TimeSeriesPredictor, float]:
         """
         Train a predictor on the given data, optionally using previous predictor or data.
 
@@ -666,14 +767,14 @@ class IncrementalTrainer(CovariateTrainer):
             year: Year of current data
             month: Month of current data
             processed_files: List of previously processed files (for combining data)
+            checkpoint_dir: Directory for checkpoints; temp models use checkpoint_dir/temp/
 
         Returns:
             Trained TimeSeriesPredictor
         """
-        model_base_path = self.incremental_config.get(
-            "model_base_path", "data/models/incremental"
-        )
-        temp_model_path = f"{model_base_path}/temp_model_{year:04d}_{month:02d}"
+        temp_base = str(Path(checkpoint_dir) / "temp")
+        Path(temp_base).mkdir(parents=True, exist_ok=True)
+        temp_model_path = f"{temp_base}/temp_model_{year:04d}_{month:02d}"
 
         # TODO: Compare training with vs without TiDE in excluded_model_types.
         # TiDE is 71-81% of runtime; include it to test quality impact on WQL/MASE.
@@ -691,11 +792,13 @@ class IncrementalTrainer(CovariateTrainer):
                 known_covariates_names=known_covariates,
                 path=temp_model_path,
             )
+            fit_start_time = time.perf_counter()
             predictor.fit(
                 ts_df,
                 presets=self.training_preset,
                 excluded_model_types=excluded,
             )
+            fit_time_s = time.perf_counter() - fit_start_time
         else:
             # Subsequent files - require lookback_days to avoid O(N^2) unbounded history
             if lookback_days is None:
@@ -723,15 +826,28 @@ class IncrementalTrainer(CovariateTrainer):
                 year, month, len(windowed_files), lookback_desc,
             )
             # Load previous data and combine with current data
+            previous_load_start_time = time.perf_counter()
             previous_data = self._load_previous_training_data(windowed_files)
+            previous_load_time_s = time.perf_counter() - previous_load_start_time
+            self.logger.info(
+                "Previous window data load time for %04d-%02d: %.3fs",
+                year,
+                month,
+                previous_load_time_s,
+            )
             if previous_data is not None:
                 # Convert previous data to TimeSeriesDataFrame
-                from ..data.resumable_loader import ResumableDataLoader
-
-                base_data_path = ConfigHelpers.get_parquet_root_dir(self.config)
-                resumable_loader = ResumableDataLoader(base_data_path, checkpoint_manager=None)
+                resumable_loader = self._get_resumable_loader(checkpoint_manager=None)
+                previous_convert_start_time = time.perf_counter()
                 previous_ts_df = resumable_loader.convert_to_timeseries_dataframe(
                     previous_data, self.config
+                )
+                previous_convert_time_s = time.perf_counter() - previous_convert_start_time
+                self.logger.info(
+                    "Previous window conversion time for %04d-%02d: %.3fs",
+                    year,
+                    month,
+                    previous_convert_time_s,
                 )
                 if previous_ts_df is not None:
                     # Do NOT pass ignore_index=True — that replaces the (item_id, timestamp)
@@ -750,13 +866,16 @@ class IncrementalTrainer(CovariateTrainer):
                 known_covariates_names=known_covariates,
                 path=temp_model_path,
             )
+            fit_start_time = time.perf_counter()
             predictor.fit(
                 combined_data,
                 presets=self.training_preset,
                 excluded_model_types=excluded,
             )
+            fit_time_s = time.perf_counter() - fit_start_time
 
-        return predictor
+        self.logger.info("predictor.fit() time for %04d-%02d: %.3fs", year, month, fit_time_s)
+        return predictor, fit_time_s
 
     def _load_validation_data(
         self, start_date: str, end_date: str
@@ -807,12 +926,7 @@ class IncrementalTrainer(CovariateTrainer):
             if not processed_files:
                 return None
 
-            from ..data.resumable_loader import ResumableDataLoader
-            from ..core.config_helpers import ConfigHelpers
-
-            base_data_path = ConfigHelpers.get_parquet_root_dir(self.config)
-            checkpoint_manager = None  # Not needed for data loading
-            resumable_loader = ResumableDataLoader(base_data_path, checkpoint_manager)
+            resumable_loader = self._get_resumable_loader(checkpoint_manager=None)
 
             # Load all previous data
             previous_dfs = []
@@ -836,23 +950,93 @@ class IncrementalTrainer(CovariateTrainer):
             )
             return None
 
+    def _get_resumable_loader(self, checkpoint_manager: Optional[CheckpointManager]) -> Any:
+        """Get shared resumable loader to avoid repeated parquet reads."""
+        if self._resumable_loader is None:
+            from ..data.resumable_loader import ResumableDataLoader
+
+            base_data_path = ConfigHelpers.get_parquet_root_dir(self.config)
+            self._resumable_loader = ResumableDataLoader(base_data_path, checkpoint_manager)
+        return self._resumable_loader
+
     def _save_final_model(
-        self, predictor: TimeSeriesPredictor, start_date: str, end_date: str
+        self,
+        model_path: Path,
+        predictor: TimeSeriesPredictor,
+        start_date: str,
+        end_date: str,
+        *,
+        performance: Optional[Dict[str, float]] = None,
+        checkpoint_dir: Optional[str] = None,
+        last_year: Optional[int] = None,
+        last_month: Optional[int] = None,
     ) -> str:
-        """Save final trained model"""
+        """Save final trained model to model_path with training_metadata.json."""
         try:
             # Create model version name
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             model_name = f"model_{start_date.replace('-', '')}_{end_date.replace('-', '')}_{timestamp}"
+            version_dir = model_path / model_name
+            version_dir.mkdir(parents=True, exist_ok=True)
 
-            # Save model
-            model_path = f"data/models/incremental/{model_name}"
-            # Set the path before saving (AutoGluon saves to predictor.path)
-            predictor.path = model_path
-            predictor.save()
+            # Copy from last checkpoint (AutoGluon save to directory can produce only version.txt)
+            if checkpoint_dir and last_year is not None and last_month is not None:
+                ckpt_path = (
+                    Path(checkpoint_dir)
+                    / "model_checkpoints"
+                    / f"model_{last_year:04d}_{last_month:02d}.pkl"
+                )
+                if ckpt_path.exists():
+                    if ckpt_path.is_dir():
+                        # Copy contents into version_dir so TimeSeriesPredictor.load(version_dir) works
+                        for item in ckpt_path.iterdir():
+                            dest = version_dir / item.name
+                            if item.is_dir():
+                                shutil.copytree(item, dest, dirs_exist_ok=True)
+                            else:
+                                shutil.copy2(item, dest)
+                        self.logger.info(
+                            "Copied checkpoint model contents from %s to %s",
+                            ckpt_path,
+                            version_dir,
+                        )
+                    else:
+                        shutil.copy2(ckpt_path, version_dir / ckpt_path.name)
+                        self.logger.info(
+                            "Copied checkpoint model file from %s to %s",
+                            ckpt_path,
+                            version_dir,
+                        )
+                else:
+                    predictor.path = str(version_dir / "predictor")
+                    predictor.save()
+            else:
+                predictor.path = str(version_dir / "predictor")
+                predictor.save()
 
-            self.logger.info(f"Final model saved to: {model_path}")
-            return model_path
+            # Post-save validation: warn if output is suspiciously small
+            total_bytes = sum(
+                f.stat().st_size for f in version_dir.rglob("*") if f.is_file()
+            )
+            if total_bytes < 1024 * 1024:  # < 1MB
+                self.logger.warning(
+                    "Final model directory size is only %d bytes; expected MB range",
+                    total_bytes,
+                )
+
+            # Write training_metadata.json so training wrapper can find this model
+            metadata = {
+                "version_id": model_name,
+                "date_range": [start_date, end_date],
+                "performance_metrics": performance or {},
+                "training_timestamp": datetime.now().isoformat(),
+            }
+            metadata_path = version_dir / "training_metadata.json"
+            with open(metadata_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
+
+            self.logger.info(f"Final model saved to: {version_dir}")
+            return str(version_dir)
 
         except Exception as e:
             self.logger.error(

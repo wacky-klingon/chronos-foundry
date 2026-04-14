@@ -37,6 +37,18 @@ class IncrementalTrainingError(Exception):
 class IncrementalTrainer(CovariateTrainer):
     """Incremental trainer for continuous model improvement with versioning and rollback"""
 
+    _CHRONOS_VARIANT_TO_MODEL_PATH: Dict[str, str] = {
+        "bolt_tiny": "autogluon/chronos-bolt-tiny",
+        "bolt_mini": "autogluon/chronos-bolt-mini",
+        "bolt_small": "autogluon/chronos-bolt-small",
+        "bolt_base": "autogluon/chronos-bolt-base",
+    }
+    _DEPRECATED_NON_CHRONOS_KEYS: Tuple[str, ...] = (
+        "excluded_model_types",
+        "training_mode",
+        "benchmark_mode",
+    )
+
     def __init__(self, config: Dict[str, Any]):
         # Pass the full config to parent CovariateTrainer so it can access parquet_loader config
         super().__init__(config)
@@ -49,9 +61,18 @@ class IncrementalTrainer(CovariateTrainer):
             "performance_threshold", 0.05
         )  # 5% improvement required
         self.rollback_enabled = self.incremental_config.get("rollback_enabled", True)
+        self.chronos_only = bool(self.incremental_config.get("chronos_only", True))
 
         # Use high_quality preset for production training (can be overridden via config)
         self.training_preset = config.get("training_preset", "high_quality")
+        self.chronos_variant = self._resolve_chronos_variant()
+        self.chronos_model_path = self._resolve_chronos_model_path(self.chronos_variant)
+        self._validate_chronos_only_configuration()
+        self.logger.info(
+            "Chronos-only incremental training enabled with variant=%s model_path=%s",
+            self.chronos_variant,
+            self.chronos_model_path,
+        )
 
         # Initialize model versioning
         versioning_config = {
@@ -60,6 +81,62 @@ class IncrementalTrainer(CovariateTrainer):
         }
         self.versioning = ModelVersioning(versioning_config)
         self._resumable_loader: Optional[Any] = None
+
+    def _resolve_chronos_variant(self) -> str:
+        """Resolve Chronos model variant from incremental config or model_name."""
+        variant = self.incremental_config.get("chronos_model_variant")
+        if isinstance(variant, str) and variant.strip():
+            return variant.strip().lower()
+
+        chronos_model = self.config.get("chronos_model", {})
+        model_name = chronos_model.get("model_name")
+        if isinstance(model_name, str) and "chronos-bolt-" in model_name:
+            return f"bolt_{model_name.split('chronos-bolt-')[-1].strip().lower()}"
+
+        raise IncrementalTrainingError(
+            "incremental_training.chronos_model_variant is required and must be one of "
+            f"{sorted(self._CHRONOS_VARIANT_TO_MODEL_PATH.keys())}"
+        )
+
+    def _resolve_chronos_model_path(self, chronos_variant: str) -> str:
+        """Map Chronos variant to AutoGluon Chronos model path."""
+        model_path = self._CHRONOS_VARIANT_TO_MODEL_PATH.get(chronos_variant)
+        if model_path is None:
+            raise IncrementalTrainingError(
+                f"Unsupported incremental_training.chronos_model_variant={chronos_variant!r}. "
+                f"Supported values: {sorted(self._CHRONOS_VARIANT_TO_MODEL_PATH.keys())}"
+            )
+        return model_path
+
+    def _validate_chronos_only_configuration(self) -> None:
+        """Fail fast when non-Chronos/mixed-model keys are present."""
+        if not self.chronos_only:
+            raise IncrementalTrainingError(
+                "incremental_training.chronos_only must be true. "
+                "Mixed-model incremental training is not supported."
+            )
+
+        deprecated_keys = [
+            key for key in self._DEPRECATED_NON_CHRONOS_KEYS if key in self.incremental_config
+        ]
+        if deprecated_keys:
+            raise IncrementalTrainingError(
+                "Deprecated non-Chronos config keys detected in incremental_training: "
+                f"{deprecated_keys}. Remove them for Chronos-only training."
+            )
+
+    def _get_chronos_hyperparameters(self) -> Dict[str, Dict[str, Any]]:
+        """Build Chronos-only hyperparameters for TimeSeriesPredictor.fit."""
+        return {
+            "Chronos": {
+                "model_path": self.chronos_model_path,
+                "context_length": self.context_length,
+                "learning_rate": self.learning_rate,
+                "batch_size": self.batch_size,
+                "max_epochs": self.max_epochs,
+                "device": self.device,
+            }
+        }
 
     def _get_excluded_model_types(self) -> List[str]:
         """
@@ -822,9 +899,13 @@ class IncrementalTrainer(CovariateTrainer):
         Path(temp_base).mkdir(parents=True, exist_ok=True)
         temp_model_path = f"{temp_base}/temp_model_{year:04d}_{month:02d}"
 
-        excluded = self._get_excluded_model_types()
         known_covariates = self.incremental_config.get("known_covariates", [])
         lookback_days = self.incremental_config.get("lookback_days")
+        chronos_hyperparameters = self._get_chronos_hyperparameters()
+        self.logger.info(
+            "Models that will be trained: ['Chronos[%s]']",
+            self.chronos_variant,
+        )
 
         if previous_predictor is None:
             # First file - create new predictor
@@ -838,7 +919,9 @@ class IncrementalTrainer(CovariateTrainer):
             predictor.fit(
                 ts_df,
                 presets=self.training_preset,
-                excluded_model_types=excluded,
+                hyperparameters=chronos_hyperparameters,
+                enable_ensemble=False,
+                skip_model_selection=True,
             )
             fit_time_s = time.perf_counter() - fit_start_time
         else:
@@ -912,7 +995,9 @@ class IncrementalTrainer(CovariateTrainer):
             predictor.fit(
                 combined_data,
                 presets=self.training_preset,
-                excluded_model_types=excluded,
+                hyperparameters=chronos_hyperparameters,
+                enable_ensemble=False,
+                skip_model_selection=True,
             )
             fit_time_s = time.perf_counter() - fit_start_time
 

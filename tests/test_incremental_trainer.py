@@ -91,6 +91,12 @@ class TestIncrementalTrainer:
                 "rollback_enabled": True,
                 "checkpoint_dir": str(Path(temp_dir) / "checkpoints"),
                 "model_base_path": str(Path(temp_dir) / "models"),
+                "excluded_model_types": [
+                    "TemporalFusionTransformer",
+                    "DeepAR",
+                    "PatchTST",
+                    "TiDE",
+                ],
             },
         }
 

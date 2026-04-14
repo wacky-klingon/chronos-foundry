@@ -61,6 +61,28 @@ class IncrementalTrainer(CovariateTrainer):
         self.versioning = ModelVersioning(versioning_config)
         self._resumable_loader: Optional[Any] = None
 
+    def _get_excluded_model_types(self) -> List[str]:
+        """
+        Load excluded_model_types from incremental_training config only.
+        No defaults in code: key must be present (empty list means exclude none).
+        """
+        raw = self.incremental_config.get("excluded_model_types")
+        if raw is None:
+            raise IncrementalTrainingError(
+                "incremental_training.excluded_model_types is required in configuration "
+                "(list of AutoGluon model type names; use [] to exclude none)."
+            )
+        if not isinstance(raw, list):
+            raise IncrementalTrainingError(
+                "incremental_training.excluded_model_types must be a list of strings."
+            )
+        for item in raw:
+            if not isinstance(item, str):
+                raise IncrementalTrainingError(
+                    "incremental_training.excluded_model_types must contain only strings."
+                )
+        return list(raw)
+
     def _ensure_path_available(
         self,
         path_value: Optional[str],
@@ -171,7 +193,7 @@ class IncrementalTrainer(CovariateTrainer):
                             "seasonal": "auto",
                         },
                     },
-                    excluded_model_types=["TemporalFusionTransformer"],
+                    excluded_model_types=self._get_excluded_model_types(),
                 )
             else:
                 # Fresh training
@@ -197,7 +219,7 @@ class IncrementalTrainer(CovariateTrainer):
                             "seasonal": "auto",
                         },
                     },
-                    excluded_model_types=["TemporalFusionTransformer"],
+                    excluded_model_types=self._get_excluded_model_types(),
                 )
 
             # Evaluate performance
@@ -776,11 +798,7 @@ class IncrementalTrainer(CovariateTrainer):
         Path(temp_base).mkdir(parents=True, exist_ok=True)
         temp_model_path = f"{temp_base}/temp_model_{year:04d}_{month:02d}"
 
-        # TODO: Compare training with vs without TiDE in excluded_model_types.
-        # TiDE is 71-81% of runtime; include it to test quality impact on WQL/MASE.
-        excluded = self.incremental_config.get(
-            "excluded_model_types", ["TemporalFusionTransformer"]
-        )
+        excluded = self._get_excluded_model_types()
         known_covariates = self.incremental_config.get("known_covariates", [])
         lookback_days = self.incremental_config.get("lookback_days")
 

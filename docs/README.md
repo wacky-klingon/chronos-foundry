@@ -26,6 +26,8 @@ Welcome to the Chronos Foundry documentation. This library provides production-g
   - [AWS Documentation Index](aws/index.md) - AWS documentation navigation
 
 - **Internal** - Development documentation
+  - [Incremental trainer operational notes](internal/incremental_trainer_operational_notes.md) - Rolling window, model exclusions, loader behavior
+  - [Implementation snapshot](internal/implementation_snapshot.md) - Historical delivery status and known risk areas
   - [Test Coverage TODO](user-guides/testing.md#test-coverage-todo-remaining) - Remaining tests to implement
 
 ## Project README

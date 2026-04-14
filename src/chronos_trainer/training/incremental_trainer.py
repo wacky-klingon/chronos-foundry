@@ -576,16 +576,34 @@ class IncrementalTrainer(CovariateTrainer):
             resumable_loader = self._get_resumable_loader(checkpoint_manager)
 
             # Get remaining files to process
+            all_parquet_files = resumable_loader.get_parquet_files(start_date, end_date)
             remaining_files = resumable_loader.get_remaining_files(start_date, end_date)
-            training_state["total_files"] = len(remaining_files)
+            training_state["total_files"] = len(all_parquet_files)
 
             if not remaining_files:
-                self.logger.info("No remaining files to process")
-                return {
-                    "status": "completed",
-                    "message": "All files already processed",
-                    "checkpoint_dir": checkpoint_dir,
-                }
+                if predictor is None:
+                    if not all_parquet_files:
+                        return {
+                            "status": "error",
+                            "message": (
+                                f"No parquet files between {start_date} and {end_date}; "
+                                "nothing to train"
+                            ),
+                            "checkpoint_dir": checkpoint_dir,
+                        }
+                    return {
+                        "status": "error",
+                        "message": (
+                            "All months appear processed but the checkpoint model could not "
+                            "be loaded; verify model_checkpoints/*.pkl under the checkpoint "
+                            "directory or clear checkpoint state for a fresh run"
+                        ),
+                        "checkpoint_dir": checkpoint_dir,
+                    }
+                self.logger.info(
+                    "No remaining parquet months; running final validation and export "
+                    "using the last checkpoint predictor"
+                )
 
             # Process each remaining file
             for file_path, year, month in remaining_files:
@@ -701,6 +719,12 @@ class IncrementalTrainer(CovariateTrainer):
                 last_year=last["year"] if last else None,
                 last_month=last["month"] if last else None,
             )
+            if not final_model_path:
+                return {
+                    "status": "error",
+                    "message": "Final model save failed (_save_final_model returned empty path)",
+                    "checkpoint_dir": checkpoint_dir,
+                }
 
             epoch_time_s = time.perf_counter() - epoch_start_time
             self.logger.info("Total epoch time: %.3fs", epoch_time_s)

@@ -318,11 +318,18 @@ def train_incremental(
             previous_model_path=None,
         )
 
-        if result.get("status") == "completed":
+        status = result.get("status")
+        if status == "completed":
             logger.info("Incremental training completed successfully!")
             logger.info(f"Checkpoint directory: {result.get('checkpoint_dir')}")
+        elif status == "error":
+            logger.error(
+                "Incremental training failed: %s",
+                result.get("message", "unknown error"),
+            )
+            sys.exit(1)
         else:
-            logger.warning(f"Training completed with status: {result.get('status')}")
+            logger.warning(f"Training completed with status: {status}")
 
     except (ValueError, ConfigValidationError) as e:
         logger.error(f"Incremental training failed: {e}")

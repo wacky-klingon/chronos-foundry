@@ -19,7 +19,14 @@ class ModelVersioning:
 
         # Versioning configuration
         self.model_base_path = Path(config.get("model_path", "data/models/incremental"))
-        self.max_versions = config.get("max_versions", 10)
+        max_versions = config.get("max_versions")
+        if max_versions is None:
+            raise ValueError(
+                "ModelVersioning requires explicit max_versions configuration (no defaults)."
+            )
+        if not isinstance(max_versions, int) or max_versions < 1:
+            raise ValueError("max_versions must be an integer >= 1.")
+        self.max_versions = max_versions
 
         # Version tracking
         self.model_versions = {}

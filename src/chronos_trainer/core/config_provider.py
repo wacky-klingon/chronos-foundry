@@ -149,14 +149,10 @@ class CentralConfigProvider:
                     "incremental_training"
                 ]
             except ConfigValidationError:
-                # Fallback to basic incremental config
-                incremental_config = {
-                    "model_versioning": True,
-                    "performance_threshold": 0.05,
-                    "rollback_enabled": True,
-                    "max_versions": 10,
-                }
-                full_config["incremental_training"] = incremental_config
+                raise ConfigValidationError(
+                    "incremental_training_config.incremental_training is required; "
+                    "no incremental defaults are allowed."
+                )
 
         # Override model path if provided
         if model_path:

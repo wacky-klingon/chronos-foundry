@@ -62,6 +62,7 @@ class IncrementalTrainer(CovariateTrainer):
         )  # 5% improvement required
         self.rollback_enabled = self.incremental_config.get("rollback_enabled", True)
         self.chronos_only = bool(self.incremental_config.get("chronos_only", True))
+        self.rollback_window_versions = self._get_required_rollback_window_versions()
 
         # Use high_quality preset for production training (can be overridden via config)
         self.training_preset = config.get("training_preset", "high_quality")
@@ -77,10 +78,24 @@ class IncrementalTrainer(CovariateTrainer):
         # Initialize model versioning
         versioning_config = {
             "model_path": config.get("model_path", "data/models/incremental"),
-            "max_versions": self.incremental_config.get("max_versions", 10),
+            "max_versions": self.rollback_window_versions,
         }
         self.versioning = ModelVersioning(versioning_config)
         self._resumable_loader: Optional[Any] = None
+
+    def _get_required_rollback_window_versions(self) -> int:
+        """Read required rollback window retention from config with no defaults."""
+        raw_value = self.incremental_config.get("rollback_window_versions")
+        if raw_value is None:
+            raise IncrementalTrainingError(
+                "incremental_training.rollback_window_versions is required. "
+                "Set it explicitly in config (e.g. rollback_window_versions: 1)."
+            )
+        if not isinstance(raw_value, int) or raw_value < 1:
+            raise IncrementalTrainingError(
+                "incremental_training.rollback_window_versions must be an integer >= 1."
+            )
+        return raw_value
 
     def _resolve_chronos_variant(self) -> str:
         """Resolve Chronos model variant from incremental config or model_name."""
@@ -137,6 +152,34 @@ class IncrementalTrainer(CovariateTrainer):
                 "device": self.device,
             }
         }
+
+    def _log_artifact_event(self, event: str, **fields: Any) -> None:
+        """Structured artifact lifecycle logging for pointer/debug diagnostics."""
+        payload = {"event": event, "component": "incremental_trainer", **fields}
+        self.logger.info("artifact_event | %s", json.dumps(payload, sort_keys=True, default=str))
+
+    def _artifact_manifest(self, model_dir: Path) -> Dict[str, Any]:
+        files = [p for p in model_dir.rglob("*") if p.is_file()]
+        rel_files = [str(p.relative_to(model_dir)) for p in files]
+        total_bytes = sum(p.stat().st_size for p in files)
+        return {
+            "file_count": len(files),
+            "total_bytes": total_bytes,
+            "sample_files": rel_files[:25],
+        }
+
+    def _validate_final_model_artifacts(self, model_dir: Path) -> Tuple[bool, List[str], Dict[str, Any]]:
+        required = [
+            model_dir / "predictor.pkl",
+            model_dir / "learner.pkl",
+            model_dir / "models" / "trainer.pkl",
+        ]
+        missing = [str(p.relative_to(model_dir)) for p in required if not p.exists()]
+        manifest = self._artifact_manifest(model_dir)
+        too_small = manifest["total_bytes"] < 1024 * 1024
+        if too_small:
+            missing.append("artifact_too_small(<1MB)")
+        return len(missing) == 0, missing, manifest
 
     def _get_excluded_model_types(self) -> List[str]:
         """
@@ -1108,10 +1151,15 @@ class IncrementalTrainer(CovariateTrainer):
 
             # Copy from last checkpoint (AutoGluon save to directory can produce only version.txt)
             if checkpoint_dir and last_year is not None and last_month is not None:
-                ckpt_path = (
-                    Path(checkpoint_dir)
-                    / "model_checkpoints"
-                    / f"model_{last_year:04d}_{last_month:02d}.pkl"
+                checkpoint_base = Path(checkpoint_dir) / "model_checkpoints"
+                ckpt_path = checkpoint_base / f"model_{last_year:04d}_{last_month:02d}"
+                if not ckpt_path.exists():
+                    ckpt_path = checkpoint_base / f"model_{last_year:04d}_{last_month:02d}.pkl"
+                self._log_artifact_event(
+                    "final_model_checkpoint_copy_attempt",
+                    checkpoint_dir=str(checkpoint_dir),
+                    checkpoint_source=str(ckpt_path),
+                    version_dir=str(version_dir),
                 )
                 if ckpt_path.exists():
                     if ckpt_path.is_dir():
@@ -1141,14 +1189,20 @@ class IncrementalTrainer(CovariateTrainer):
                 predictor.path = str(version_dir / "predictor")
                 predictor.save()
 
-            # Post-save validation: warn if output is suspiciously small
-            total_bytes = sum(
-                f.stat().st_size for f in version_dir.rglob("*") if f.is_file()
+            valid, missing, manifest = self._validate_final_model_artifacts(version_dir)
+            self._log_artifact_event(
+                "final_model_validation",
+                version_dir=str(version_dir),
+                valid=valid,
+                missing_required=missing,
+                file_count=manifest["file_count"],
+                total_bytes=manifest["total_bytes"],
+                sample_files=manifest["sample_files"],
             )
-            if total_bytes < 1024 * 1024:  # < 1MB
-                self.logger.warning(
-                    "Final model directory size is only %d bytes; expected MB range",
-                    total_bytes,
+            if not valid:
+                raise IncrementalTrainingError(
+                    "Final model artifact validation failed: "
+                    f"missing_or_invalid={missing}, version_dir={version_dir}"
                 )
 
             # Write training_metadata.json so training wrapper can find this model

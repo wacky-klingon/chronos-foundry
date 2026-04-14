@@ -11,7 +11,7 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 import logging
 
 from autogluon.timeseries import TimeSeriesPredictor
@@ -37,6 +37,55 @@ class CheckpointManager:
         self.model_checkpoints_dir.mkdir(exist_ok=True)
 
         self.logger = logging.getLogger("checkpoint_manager")
+        self.logger.info(
+            "checkpoint_init | checkpoint_dir=%s checkpoints_dir=%s model_checkpoints_dir=%s",
+            self.checkpoint_dir,
+            self.checkpoints_dir,
+            self.model_checkpoints_dir,
+        )
+
+    def _log_event(self, event: str, **fields: Any) -> None:
+        """Emit structured checkpoint logs for AWS debugging."""
+        payload = {"event": event, "component": "checkpoint_manager", **fields}
+        self.logger.info("checkpoint_event | %s", json.dumps(payload, sort_keys=True, default=str))
+
+    def _required_model_artifacts_present(self, model_dir: Path) -> Tuple[bool, List[str], List[str], int]:
+        """
+        Validate that a model directory contains a loadable AutoGluon predictor structure.
+        """
+        required_paths = [
+            model_dir / "predictor.pkl",
+            model_dir / "learner.pkl",
+            model_dir / "models" / "trainer.pkl",
+        ]
+        missing = [str(p.relative_to(model_dir)) for p in required_paths if not p.exists()]
+        files = [p for p in model_dir.rglob("*") if p.is_file()]
+        total_bytes = sum(p.stat().st_size for p in files)
+        sample = [str(p.relative_to(model_dir)) for p in files[:20]]
+        return len(missing) == 0, missing, sample, total_bytes
+
+    def _checkpoint_model_dir(self, year: int, month: int) -> Path:
+        """Canonical checkpoint model directory (directory, not .pkl extension)."""
+        return self.model_checkpoints_dir / f"model_{year:04d}_{month:02d}"
+
+    def _legacy_checkpoint_model_dir(self, year: int, month: int) -> Path:
+        """Legacy checkpoint model path retained for backward compatibility."""
+        return self.model_checkpoints_dir / f"model_{year:04d}_{month:02d}.pkl"
+
+    def _resolve_checkpoint_model_path(self, model_path_value: str) -> Optional[Path]:
+        """Resolve checkpoint model path across canonical and legacy layouts."""
+        primary = Path(model_path_value)
+        if primary.exists():
+            return primary
+        if model_path_value.endswith(".pkl"):
+            fallback = Path(model_path_value[:-4])
+            if fallback.exists():
+                return fallback
+        else:
+            legacy = Path(f"{model_path_value}.pkl")
+            if legacy.exists():
+                return legacy
+        return None
 
     def save_checkpoint(
         self,
@@ -65,13 +114,53 @@ class CheckpointManager:
 
             # Create checkpoint filename
             checkpoint_name = f"checkpoint_{year:04d}_{month:02d}.json"
-            model_name = f"model_{year:04d}_{month:02d}.pkl"
+            model_path = self._checkpoint_model_dir(year, month)
+            legacy_model_path = self._legacy_checkpoint_model_dir(year, month)
 
-            # Save model
-            model_path = self.model_checkpoints_dir / model_name
-            # Set the path before saving (AutoGluon saves to predictor.path)
-            model.path = str(model_path)
-            model.save()
+            # Remove legacy path if present to avoid stale pointer confusion.
+            if legacy_model_path.exists() and legacy_model_path != model_path:
+                if legacy_model_path.is_dir():
+                    for item in legacy_model_path.rglob("*"):
+                        if item.is_file():
+                            item.unlink()
+                    for item in sorted(legacy_model_path.glob("**/*"), reverse=True):
+                        if item.is_dir():
+                            item.rmdir()
+                    legacy_model_path.rmdir()
+                else:
+                    legacy_model_path.unlink()
+
+            # Save model by copying already-trained predictor artifacts.
+            # Changing predictor.path and calling save() here can emit only version metadata.
+            source_model_path = Path(getattr(model, "path", "")).resolve()
+            if not source_model_path.exists():
+                raise RuntimeError(
+                    f"Checkpoint source predictor path does not exist: {source_model_path}"
+                )
+            if model_path.exists():
+                shutil.rmtree(model_path)
+            self._log_event(
+                "checkpoint_model_save_start",
+                year=year,
+                month=month,
+                model_path=str(model_path),
+                source_model_path=str(source_model_path),
+            )
+            shutil.copytree(source_model_path, model_path, dirs_exist_ok=True)
+            valid, missing, sample, total_bytes = self._required_model_artifacts_present(model_path)
+            self._log_event(
+                "checkpoint_model_save_done",
+                year=year,
+                month=month,
+                model_path=str(model_path),
+                model_total_bytes=total_bytes,
+                missing_required_paths=missing,
+                file_sample=sample,
+            )
+            if not valid:
+                raise RuntimeError(
+                    f"Checkpoint model artifacts incomplete at {model_path}; missing required paths: {missing}"
+                )
 
             # Create checkpoint data
             checkpoint_data = {
@@ -97,6 +186,12 @@ class CheckpointManager:
 
         except Exception as e:
             self.logger.error(f"Failed to save checkpoint: {e}")
+            self._log_event(
+                "checkpoint_save_failed",
+                year=year,
+                month=month,
+                error=str(e),
+            )
             return False
 
     def load_checkpoint(self, year: int, month: int) -> Optional[Dict[str, Any]]:
@@ -122,9 +217,22 @@ class CheckpointManager:
 
             # Load model
             model_path = checkpoint_data["model_path"]
-            if os.path.exists(model_path):
-                model = TimeSeriesPredictor.load(model_path)
+            resolved_model_path = self._resolve_checkpoint_model_path(model_path)
+            self._log_event(
+                "checkpoint_load_attempt",
+                checkpoint_name=checkpoint_name,
+                model_path=model_path,
+                resolved_model_path=str(resolved_model_path) if resolved_model_path else None,
+            )
+            if resolved_model_path and resolved_model_path.exists():
+                model = TimeSeriesPredictor.load(str(resolved_model_path))
                 checkpoint_data["model"] = model
+            else:
+                self._log_event(
+                    "checkpoint_load_missing_model",
+                    checkpoint_name=checkpoint_name,
+                    model_path=model_path,
+                )
 
             self.logger.info(f"Checkpoint loaded: {checkpoint_name}")
             return checkpoint_data
@@ -157,9 +265,22 @@ class CheckpointManager:
 
             # Load model
             model_path = checkpoint_data["model_path"]
-            if os.path.exists(model_path):
-                model = TimeSeriesPredictor.load(model_path)
+            resolved_model_path = self._resolve_checkpoint_model_path(model_path)
+            self._log_event(
+                "last_checkpoint_load_attempt",
+                checkpoint_name=latest_checkpoint.name,
+                model_path=model_path,
+                resolved_model_path=str(resolved_model_path) if resolved_model_path else None,
+            )
+            if resolved_model_path and resolved_model_path.exists():
+                model = TimeSeriesPredictor.load(str(resolved_model_path))
                 checkpoint_data["model"] = model
+            else:
+                self._log_event(
+                    "last_checkpoint_model_missing",
+                    checkpoint_name=latest_checkpoint.name,
+                    model_path=model_path,
+                )
 
             self.logger.info(f"Last checkpoint loaded: {latest_checkpoint.name}")
             return checkpoint_data

@@ -7,11 +7,21 @@ Tests checkpoint saving, loading, and progress tracking.
 import pytest
 import tempfile
 import json
+import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-from datetime import datetime
-
 from chronos_trainer.training.checkpoint_manager import CheckpointManager
+
+
+def _minimal_autogluon_predictor_dir(parent: Path) -> str:
+    """Directory layout required by CheckpointManager.save_checkpoint copy + validation."""
+    d = parent / "fake_predictor"
+    d.mkdir(parents=True)
+    (d / "predictor.pkl").write_bytes(b"x")
+    (d / "learner.pkl").write_bytes(b"x")
+    (d / "models").mkdir()
+    (d / "models" / "trainer.pkl").write_bytes(b"x")
+    return str(d)
 
 
 class TestCheckpointManager:
@@ -22,7 +32,6 @@ class TestCheckpointManager:
         """Create temporary checkpoint directory"""
         temp = tempfile.mkdtemp()
         yield temp
-        import shutil
         shutil.rmtree(temp, ignore_errors=True)
 
     @pytest.fixture
@@ -31,10 +40,10 @@ class TestCheckpointManager:
         return CheckpointManager(checkpoint_dir)
 
     @pytest.fixture
-    def mock_predictor(self):
-        """Create mock TimeSeriesPredictor"""
+    def mock_predictor(self, tmp_path):
+        """Mock predictor with a real on-disk path (checkpoint copies artifacts)."""
         mock = MagicMock()
-        mock.path = None
+        mock.path = _minimal_autogluon_predictor_dir(tmp_path)
         mock.save = MagicMock()
         return mock
 
@@ -64,7 +73,6 @@ class TestCheckpointManager:
         )
 
         assert success, "Checkpoint save should succeed"
-        assert mock_predictor.save.called, "Model save should be called"
 
         # Verify checkpoint file exists
         checkpoint_file = (
@@ -96,7 +104,11 @@ class TestCheckpointManager:
         last_checkpoint = checkpoint_manager.get_last_checkpoint()
         assert last_checkpoint is None, "Should return None when no checkpoints"
 
-    def test_get_last_checkpoint_single(self, checkpoint_manager, mock_predictor):
+    @patch(
+        "chronos_trainer.training.checkpoint_manager.TimeSeriesPredictor.load",
+        return_value=MagicMock(),
+    )
+    def test_get_last_checkpoint_single(self, mock_load, checkpoint_manager, mock_predictor):
         """Test getting last checkpoint when one exists"""
         data_stats = {"record_count": 100}
         training_state = {"start_date": "2020-01-01", "end_date": "2020-01-31"}
@@ -114,7 +126,11 @@ class TestCheckpointManager:
         assert last_checkpoint["year"] == 2020
         assert last_checkpoint["month"] == 1
 
-    def test_get_last_checkpoint_multiple(self, checkpoint_manager, mock_predictor):
+    @patch(
+        "chronos_trainer.training.checkpoint_manager.TimeSeriesPredictor.load",
+        return_value=MagicMock(),
+    )
+    def test_get_last_checkpoint_multiple(self, mock_load, checkpoint_manager, mock_predictor):
         """Test getting most recent checkpoint when multiple exist"""
         data_stats = {"record_count": 100}
         training_state = {"start_date": "2020-01-01", "end_date": "2020-03-31"}
@@ -152,7 +168,11 @@ class TestCheckpointManager:
         assert progress["last_processed"] is None
         assert progress["total_checkpoints"] == 0
 
-    def test_training_progress_in_progress(self, checkpoint_manager, mock_predictor):
+    @patch(
+        "chronos_trainer.training.checkpoint_manager.TimeSeriesPredictor.load",
+        return_value=MagicMock(),
+    )
+    def test_training_progress_in_progress(self, mock_load, checkpoint_manager, mock_predictor):
         """Test training progress when checkpoints exist"""
         data_stats = {"record_count": 100}
         training_state = {"start_date": "2020-01-01", "end_date": "2020-02-28"}
@@ -171,4 +191,38 @@ class TestCheckpointManager:
         assert progress["last_processed"] == "2020-01"
         assert progress["total_checkpoints"] == 1
         assert "last_checkpoint_time" in progress
+
+    def test_remove_temp_directory_idempotent(self, checkpoint_manager, checkpoint_dir):
+        """temp/ is removed when present; missing temp is a no-op."""
+        temp = Path(checkpoint_dir) / "temp"
+        temp.mkdir(parents=True)
+        (temp / "stub.txt").write_text("x", encoding="utf-8")
+        checkpoint_manager.remove_temp_directory()
+        assert not temp.exists()
+        checkpoint_manager.remove_temp_directory()
+
+    def test_prune_model_checkpoints_keeps_last_n(self, checkpoint_manager, checkpoint_dir):
+        """Keep N most recent model_YYYY_MM dirs; remove older."""
+        mdir = Path(checkpoint_dir) / "model_checkpoints"
+        for y, m in [(2006, 1), (2006, 2), (2006, 3)]:
+            d = mdir / f"model_{y:04d}_{m:02d}"
+            d.mkdir(parents=True)
+            (d / "marker.txt").write_text(str(m), encoding="utf-8")
+
+        checkpoint_manager.prune_model_checkpoints(1)
+        assert (mdir / "model_2006_03").exists()
+        assert not (mdir / "model_2006_01").exists()
+        assert not (mdir / "model_2006_02").exists()
+
+    def test_prune_model_checkpoints_keep_two(self, checkpoint_manager, checkpoint_dir):
+        mdir = Path(checkpoint_dir) / "model_checkpoints"
+        for y, m in [(2006, 1), (2006, 2), (2006, 3)]:
+            d = mdir / f"model_{y:04d}_{m:02d}"
+            d.mkdir(parents=True)
+            (d / "marker.txt").write_text(str(m), encoding="utf-8")
+
+        checkpoint_manager.prune_model_checkpoints(2)
+        assert (mdir / "model_2006_02").exists()
+        assert (mdir / "model_2006_03").exists()
+        assert not (mdir / "model_2006_01").exists()
 

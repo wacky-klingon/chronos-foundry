@@ -1,11 +1,24 @@
-[tool.poetry]
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
 name = "chronos-foundry"
 version = "0.1.0"
 description = "Production-grade Chronos forecasting system with covariate integration, incremental training, and AWS orchestration"
-authors = ["Rupinder Mazara <mazara.rupinder@gmail.com>"]
 readme = "README.md"
 license = "MIT"
-packages = [{include = "chronos_trainer", from = "src"}]
+authors = [
+    { name = "Rupinder Mazara", email = "mazara.rupinder@gmail.com" },
+]
+requires-python = ">=3.9,<3.13"
+# Declared in [tool.poetry.dependencies] (Poetry-specific constraints).
+dynamic = ["dependencies"]
+
+[tool.poetry]
+# Poetry 2.x: install this repo into the venv so `import chronos_trainer` works (not deps-only).
+package-mode = true
+packages = [{ include = "chronos_trainer", from = "src" }]
 
 [tool.poetry.dependencies]
 python = ">=3.9,<3.13"
@@ -47,8 +60,3 @@ multi_line_output = 3
 python_version = "3.9"
 warn_return_any = true
 warn_unused_configs = true
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
-

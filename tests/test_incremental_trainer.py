@@ -17,6 +17,29 @@ from chronos_trainer import IncrementalTrainer
 from chronos_trainer.training.checkpoint_manager import CheckpointManager
 
 
+# Final export validation requires total artifact size >= 1 MiB (see IncrementalTrainer).
+_MIN_FINAL_MODEL_BYTES = 1024 * 1024
+
+
+def _minimal_autogluon_predictor_dir(
+    parent: Path, *, min_total_bytes: int = 0
+) -> str:
+    """Directory layout required by CheckpointManager.save_checkpoint."""
+    d = parent / "fake_predictor"
+    if d.exists():
+        shutil.rmtree(d)
+    d.mkdir(parents=True)
+    (d / "predictor.pkl").write_bytes(b"x")
+    (d / "learner.pkl").write_bytes(b"x")
+    (d / "models").mkdir()
+    (d / "models" / "trainer.pkl").write_bytes(b"x")
+    if min_total_bytes > 0:
+        total = sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
+        if total < min_total_bytes:
+            (d / "_padding.bin").write_bytes(b"\0" * (min_total_bytes - total))
+    return str(d)
+
+
 class TestIncrementalTrainer:
     """Test IncrementalTrainer functionality"""
 
@@ -62,6 +85,8 @@ class TestIncrementalTrainer:
     def sample_config(self, temp_dir, sample_data_dir):
         """Create sample configuration for incremental training"""
         return {
+            # Required for train_with_checkpoints / final model export
+            "model_path": str(Path(temp_dir) / "models"),
             # Model configuration
             "model_name": "amazon/chronos-t5-tiny",
             "context_length": 96,
@@ -86,23 +111,26 @@ class TestIncrementalTrainer:
 
             # Incremental training configuration
             "incremental_training": {
+                "chronos_only": True,
+                "chronos_model_variant": "bolt_small",
                 "model_versioning": True,
                 "performance_threshold": 0.05,
                 "rollback_enabled": True,
+                "rollback_window_versions": 1,
+                "checkpoint_post_success_cleanup": False,
+                "lookback_days": 90,
                 "checkpoint_dir": str(Path(temp_dir) / "checkpoints"),
                 "model_base_path": str(Path(temp_dir) / "models"),
-                "excluded_model_types": [
-                    "TemporalFusionTransformer",
-                    "DeepAR",
-                    "PatchTST",
-                    "TiDE",
-                ],
             },
         }
 
     @pytest.mark.slow
+    @patch(
+        "chronos_trainer.training.checkpoint_manager.TimeSeriesPredictor.load",
+        return_value=MagicMock(),
+    )
     def test_integration_resumable_training(
-        self, temp_dir, sample_data_dir, sample_config
+        self, _mock_ts_load, temp_dir, sample_data_dir, sample_config
     ):
         """
         Test full end-to-end incremental training workflow
@@ -120,10 +148,12 @@ class TestIncrementalTrainer:
         # Mock the actual training to avoid slow model training
         with patch.object(trainer, "_train_predictor") as mock_train:
             mock_predictor = MagicMock()
-            mock_predictor.path = None
+            mock_predictor.path = _minimal_autogluon_predictor_dir(
+                Path(temp_dir), min_total_bytes=_MIN_FINAL_MODEL_BYTES
+            )
             mock_predictor.fit = MagicMock()
             mock_predictor.predict = MagicMock(return_value=pd.DataFrame())
-            mock_train.return_value = mock_predictor
+            mock_train.return_value = (mock_predictor, 0.01)
 
             result = trainer.train_with_checkpoints(
                 start_date="2020-01-01",
@@ -150,7 +180,11 @@ class TestIncrementalTrainer:
                 assert last_checkpoint["month"] in [1, 2]
 
     @pytest.mark.slow
-    def test_resume_training(self, temp_dir, sample_data_dir, sample_config):
+    @patch(
+        "chronos_trainer.training.checkpoint_manager.TimeSeriesPredictor.load",
+        return_value=MagicMock(),
+    )
+    def test_resume_training(self, _mock_ts_load, temp_dir, sample_data_dir, sample_config):
         """
         Test resuming training from checkpoint
 
@@ -166,10 +200,12 @@ class TestIncrementalTrainer:
         # Mock training to avoid slow execution
         with patch.object(trainer, "_train_predictor") as mock_train:
             mock_predictor = MagicMock()
-            mock_predictor.path = None
+            mock_predictor.path = _minimal_autogluon_predictor_dir(
+                Path(temp_dir), min_total_bytes=_MIN_FINAL_MODEL_BYTES
+            )
             mock_predictor.fit = MagicMock()
             mock_predictor.predict = MagicMock(return_value=pd.DataFrame())
-            mock_train.return_value = mock_predictor
+            mock_train.return_value = (mock_predictor, 0.01)
 
             # First training run - process January only
             result1 = trainer.train_with_checkpoints(
@@ -205,8 +241,13 @@ class TestIncrementalTrainer:
                 progress = checkpoint_manager.get_training_progress()
                 assert progress["status"] == "in_progress" or progress["total_checkpoints"] >= 1
 
-    def test_no_remaining_files(self, temp_dir, sample_data_dir, sample_config):
+    @patch("chronos_trainer.training.checkpoint_manager.TimeSeriesPredictor.load")
+    def test_no_remaining_files(
+        self, mock_ts_load, temp_dir, sample_data_dir, sample_config
+    ):
         """Test behavior when all files are already processed"""
+        mock_ts_load.return_value = MagicMock()
+
         checkpoint_dir = str(Path(temp_dir) / "checkpoints")
 
         trainer = IncrementalTrainer(sample_config)
@@ -214,7 +255,9 @@ class TestIncrementalTrainer:
         # Create a checkpoint manager and save training state indicating all files processed
         checkpoint_manager = CheckpointManager(checkpoint_dir)
         mock_predictor = MagicMock()
-        mock_predictor.path = None
+        mock_predictor.path = _minimal_autogluon_predictor_dir(
+            Path(temp_dir), min_total_bytes=_MIN_FINAL_MODEL_BYTES
+        )
         mock_predictor.save = MagicMock()
 
         # Save checkpoint with all files marked as processed
@@ -226,6 +269,8 @@ class TestIncrementalTrainer:
             training_state={
                 "start_date": "2020-01-01",
                 "end_date": "2020-02-28",
+                "validation_start_date": "2020-03-01",
+                "validation_end_date": "2020-03-07",
                 "processed_files": [
                     {"file_path": "data.parquet", "year": 2020, "month": 1},
                     {"file_path": "data.parquet", "year": 2020, "month": 2},
@@ -243,5 +288,35 @@ class TestIncrementalTrainer:
         )
 
         assert result["status"] == "completed"
-        assert "All files already processed" in result.get("message", "")
+        assert "completed successfully" in result.get("message", "")
+
+    def test_apply_checkpoint_post_success_cleanup_true(self, temp_dir, sample_config):
+        """When enabled, temp/ is removed and model_checkpoints/ pruned to rollback_window."""
+        sample_config["incremental_training"]["checkpoint_post_success_cleanup"] = True
+        ck = Path(temp_dir) / "ckpt_cleanup"
+        ck.mkdir(parents=True)
+        (ck / "temp" / "scratch").mkdir(parents=True)
+        mcp = ck / "model_checkpoints"
+        for y, m in [(2006, 1), (2006, 2)]:
+            (mcp / f"model_{y:04d}_{m:02d}").mkdir(parents=True)
+
+        trainer = IncrementalTrainer(sample_config)
+        cm = CheckpointManager(str(ck))
+        trainer._apply_checkpoint_post_success_cleanup(cm)
+
+        assert not (ck / "temp").exists()
+        assert not (mcp / "model_2006_01").exists()
+        assert (mcp / "model_2006_02").exists()
+
+    def test_apply_checkpoint_post_success_cleanup_false_noop(self, temp_dir, sample_config):
+        sample_config["incremental_training"]["checkpoint_post_success_cleanup"] = False
+        ck = Path(temp_dir) / "ckpt_no_cleanup"
+        ck.mkdir(parents=True)
+        (ck / "temp" / "scratch").mkdir(parents=True)
+
+        trainer = IncrementalTrainer(sample_config)
+        cm = CheckpointManager(str(ck))
+        trainer._apply_checkpoint_post_success_cleanup(cm)
+
+        assert (ck / "temp").exists()
 

@@ -63,6 +63,9 @@ class IncrementalTrainer(CovariateTrainer):
         self.rollback_enabled = self.incremental_config.get("rollback_enabled", True)
         self.chronos_only = bool(self.incremental_config.get("chronos_only", True))
         self.rollback_window_versions = self._get_required_rollback_window_versions()
+        self.checkpoint_post_success_cleanup = (
+            self._get_required_checkpoint_post_success_cleanup()
+        )
 
         # Use high_quality preset for production training (can be overridden via config)
         self.training_preset = config.get("training_preset", "high_quality")
@@ -96,6 +99,30 @@ class IncrementalTrainer(CovariateTrainer):
                 "incremental_training.rollback_window_versions must be an integer >= 1."
             )
         return raw_value
+
+    def _get_required_checkpoint_post_success_cleanup(self) -> bool:
+        """Read whether to run temp + model_checkpoints cleanup after successful checkpoint training."""
+        raw = self.incremental_config.get("checkpoint_post_success_cleanup")
+        if raw is None:
+            raise IncrementalTrainingError(
+                "incremental_training.checkpoint_post_success_cleanup is required "
+                "(boolean: enable post-success removal of checkpoint temp/ and pruning of "
+                "older model_checkpoints/ dirs)."
+            )
+        if not isinstance(raw, bool):
+            raise IncrementalTrainingError(
+                "incremental_training.checkpoint_post_success_cleanup must be a boolean."
+            )
+        return raw
+
+    def _apply_checkpoint_post_success_cleanup(
+        self, checkpoint_manager: CheckpointManager
+    ) -> None:
+        """After successful final export only; does nothing if cleanup disabled."""
+        if not self.checkpoint_post_success_cleanup:
+            return
+        checkpoint_manager.remove_temp_directory()
+        checkpoint_manager.prune_model_checkpoints(self.rollback_window_versions)
 
     def _resolve_chronos_variant(self) -> str:
         """Resolve Chronos model variant from incremental config or model_name."""
@@ -845,6 +872,8 @@ class IncrementalTrainer(CovariateTrainer):
                     "message": "Final model save failed (_save_final_model returned empty path)",
                     "checkpoint_dir": checkpoint_dir,
                 }
+
+            self._apply_checkpoint_post_success_cleanup(checkpoint_manager)
 
             epoch_time_s = time.perf_counter() - epoch_start_time
             self.logger.info("Total epoch time: %.3fs", epoch_time_s)

@@ -8,6 +8,7 @@ and allows resuming from the last successful checkpoint.
 
 import json
 import os
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -372,3 +373,90 @@ class CheckpointManager:
         except Exception as e:
             self.logger.error(f"Failed to load training state: {e}")
             return None
+
+    _MODEL_DIR_RE = re.compile(r"^model_(\d{4})_(\d{2})$")
+
+    def remove_temp_directory(self) -> None:
+        """Remove checkpoint_dir/temp (AutoGluon scratch trees). Idempotent."""
+        temp_path = self.checkpoint_dir / "temp"
+        if not temp_path.exists():
+            self._log_event(
+                "checkpoint_cleanup_temp",
+                reason="skipped_missing",
+                path=str(temp_path),
+            )
+            return
+        try:
+            shutil.rmtree(temp_path)
+            self._log_event(
+                "checkpoint_cleanup_temp",
+                reason="deleted",
+                path=str(temp_path),
+            )
+        except OSError as e:
+            self._log_event(
+                "checkpoint_cleanup_temp",
+                reason="failed",
+                path=str(temp_path),
+                error=str(e),
+            )
+            raise
+
+    def _list_sorted_model_checkpoint_dirs(self) -> List[Tuple[Tuple[int, int], Path]]:
+        """Canonical monthly dirs model_YYYY_MM (directories only)."""
+        found: List[Tuple[Tuple[int, int], Path]] = []
+        if not self.model_checkpoints_dir.exists():
+            return found
+        for entry in self.model_checkpoints_dir.iterdir():
+            if not entry.is_dir():
+                continue
+            match = self._MODEL_DIR_RE.match(entry.name)
+            if not match:
+                continue
+            year, month = int(match.group(1)), int(match.group(2))
+            found.append(((year, month), entry))
+        found.sort(key=lambda x: x[0])
+        return found
+
+    def prune_model_checkpoints(self, keep_n: int) -> None:
+        """
+        Keep the N most recent model_YYYY_MM directories; remove older ones.
+
+        Legacy single-file paths (model_YYYY_MM.pkl) are not removed here.
+        """
+        if keep_n < 1:
+            self._log_event(
+                "checkpoint_prune_model_checkpoints",
+                reason="skipped_invalid_keep_n",
+                keep_n=keep_n,
+            )
+            return
+
+        sorted_dirs = self._list_sorted_model_checkpoint_dirs()
+        if len(sorted_dirs) <= keep_n:
+            self._log_event(
+                "checkpoint_prune_model_checkpoints",
+                reason="skipped_no_prune_needed",
+                keep_n=keep_n,
+                dir_count=len(sorted_dirs),
+            )
+            return
+
+        to_remove = sorted_dirs[: len(sorted_dirs) - keep_n]
+        for (_ym, path) in to_remove:
+            try:
+                shutil.rmtree(path)
+                self._log_event(
+                    "checkpoint_prune_model_checkpoints",
+                    reason="deleted",
+                    path=str(path),
+                    keep_n=keep_n,
+                )
+            except OSError as e:
+                self._log_event(
+                    "checkpoint_prune_model_checkpoints",
+                    reason="failed",
+                    path=str(path),
+                    error=str(e),
+                )
+                raise

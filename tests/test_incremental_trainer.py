@@ -13,9 +13,11 @@ import pyarrow.parquet as pq
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 import shutil
+import logging
 
 from chronos_trainer import IncrementalTrainer
 from chronos_trainer.training.checkpoint_manager import CheckpointManager
+from chronos_trainer.training.incremental_trainer import IncrementalTrainingError
 
 
 # Final export validation requires total artifact size >= 1 MiB (see IncrementalTrainer).
@@ -403,4 +405,136 @@ class TestIncrementalTrainer:
         assert result["validation_reason"] == "insufficient_series_length"
         assert result["validation_summary"]["series_included"] == 0
         mock_predictor.predict.assert_not_called()
+
+    @patch(
+        "chronos_trainer.training.checkpoint_manager.TimeSeriesPredictor.load",
+        return_value=MagicMock(),
+    )
+    def test_checkpoint_training_uses_previous_model_warm_start(
+        self, _mock_ts_load, temp_dir, sample_config, caplog
+    ):
+        checkpoint_dir = str(Path(temp_dir) / "checkpoints")
+        previous_model_path = Path(temp_dir) / "previous_model"
+        previous_model_path.mkdir(parents=True)
+
+        trainer = IncrementalTrainer(sample_config)
+        warm_predictor = MagicMock()
+        final_predictor = MagicMock()
+        final_predictor.path = _minimal_autogluon_predictor_dir(
+            Path(temp_dir), min_total_bytes=_MIN_FINAL_MODEL_BYTES
+        )
+
+        with patch.object(
+            trainer, "_load_previous_model", return_value=warm_predictor
+        ), patch.object(
+            trainer, "_train_predictor", return_value=(final_predictor, 0.01)
+        ):
+            with caplog.at_level(logging.INFO):
+                result = trainer.train_with_checkpoints(
+                    start_date="2020-01-01",
+                    end_date="2020-01-31",
+                    validation_start_date="2020-02-01",
+                    validation_end_date="2020-02-07",
+                    checkpoint_dir=checkpoint_dir,
+                    previous_model_path=str(previous_model_path),
+                )
+
+        assert result["status"] == "completed"
+        assert (
+            "mode=warm_start_from_previous_model" in caplog.text
+        ), caplog.text
+        assert "mode=fresh_start_fallback_from_previous_model" not in caplog.text
+
+    @patch(
+        "chronos_trainer.training.checkpoint_manager.TimeSeriesPredictor.load",
+        return_value=MagicMock(),
+    )
+    def test_checkpoint_training_falls_back_when_previous_model_unloadable(
+        self, _mock_ts_load, temp_dir, sample_config, caplog
+    ):
+        checkpoint_dir = str(Path(temp_dir) / "checkpoints")
+        previous_model_path = Path(temp_dir) / "previous_model"
+        previous_model_path.mkdir(parents=True)
+
+        trainer = IncrementalTrainer(sample_config)
+        final_predictor = MagicMock()
+        final_predictor.path = _minimal_autogluon_predictor_dir(
+            Path(temp_dir), min_total_bytes=_MIN_FINAL_MODEL_BYTES
+        )
+
+        with patch.object(
+            trainer,
+            "_load_previous_model",
+            side_effect=IncrementalTrainingError("corrupt_previous_model"),
+        ), patch.object(
+            trainer, "_train_predictor", return_value=(final_predictor, 0.01)
+        ):
+            with caplog.at_level(logging.WARNING):
+                result = trainer.train_with_checkpoints(
+                    start_date="2020-01-01",
+                    end_date="2020-01-31",
+                    validation_start_date="2020-02-01",
+                    validation_end_date="2020-02-07",
+                    checkpoint_dir=checkpoint_dir,
+                    previous_model_path=str(previous_model_path),
+                )
+
+        assert result["status"] == "completed"
+        assert "mode=fresh_start_fallback_from_previous_model" in caplog.text
+        assert "fallback_reason=corrupt_previous_model" in caplog.text
+
+    @patch(
+        "chronos_trainer.training.checkpoint_manager.TimeSeriesPredictor.load",
+        return_value=MagicMock(),
+    )
+    def test_resume_checkpoint_takes_precedence_over_previous_model(
+        self, _mock_ts_load, temp_dir, sample_config, caplog
+    ):
+        checkpoint_dir = str(Path(temp_dir) / "checkpoints")
+        checkpoint_manager = CheckpointManager(checkpoint_dir)
+        prior_predictor = MagicMock()
+        prior_predictor.path = _minimal_autogluon_predictor_dir(
+            Path(temp_dir), min_total_bytes=_MIN_FINAL_MODEL_BYTES
+        )
+        checkpoint_manager.save_checkpoint(
+            year=2020,
+            month=1,
+            model=prior_predictor,
+            data_stats={"record_count": 100},
+            training_state={
+                "start_date": "2020-01-01",
+                "end_date": "2020-02-28",
+                "validation_start_date": "2020-03-01",
+                "validation_end_date": "2020-03-07",
+                "processed_files": [
+                    {"file_path": "data.parquet", "year": 2020, "month": 1}
+                ],
+                "total_files": 2,
+            },
+        )
+
+        previous_model_path = Path(temp_dir) / "previous_model"
+        previous_model_path.mkdir(parents=True)
+        trainer = IncrementalTrainer(sample_config)
+        final_predictor = MagicMock()
+        final_predictor.path = _minimal_autogluon_predictor_dir(
+            Path(temp_dir), min_total_bytes=_MIN_FINAL_MODEL_BYTES
+        )
+
+        with patch.object(
+            trainer, "_train_predictor", return_value=(final_predictor, 0.01)
+        ):
+            with caplog.at_level(logging.INFO):
+                result = trainer.train_with_checkpoints(
+                    start_date="2020-01-01",
+                    end_date="2020-02-28",
+                    validation_start_date="2020-03-01",
+                    validation_end_date="2020-03-07",
+                    checkpoint_dir=checkpoint_dir,
+                    previous_model_path=str(previous_model_path),
+                )
+
+        assert result["status"] == "completed"
+        assert "mode=resume_from_disk" in caplog.text
+        assert "previous_model is ignored while resuming from checkpoint" in caplog.text
 

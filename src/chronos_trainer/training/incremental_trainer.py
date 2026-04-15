@@ -263,6 +263,51 @@ class IncrementalTrainer(CovariateTrainer):
         """Ensure model_path is configured and available. Raises if not."""
         return self._ensure_path_available(model_path, "model_path")
 
+    def _resolve_warm_start_predictor(
+        self, previous_model_path: Optional[str]
+    ) -> Tuple[Optional[TimeSeriesPredictor], str, str]:
+        """
+        Resolve best-effort warm start predictor for checkpoint training.
+
+        Returns:
+            (predictor, mode_token, detail)
+        """
+        if not previous_model_path:
+            return None, "fresh_start_no_previous_model", "previous_model=not_provided"
+
+        path = Path(previous_model_path)
+        if not path.exists():
+            reason = "previous_model_missing_on_disk"
+            detail = (
+                f"previous_model=path={previous_model_path!r} exists=False "
+                f"fallback_reason={reason}"
+            )
+            self.logger.warning(
+                "incremental_checkpoint_decision mode=fresh_start_fallback_from_previous_model %s",
+                detail,
+            )
+            return None, "fresh_start_fallback_from_previous_model", detail
+
+        try:
+            predictor = self._load_previous_model(str(path))
+            detail = f"previous_model=path={previous_model_path!r} exists=True"
+            self.logger.info(
+                "incremental_checkpoint_decision mode=warm_start_from_previous_model %s",
+                detail,
+            )
+            return predictor, "warm_start_from_previous_model", detail
+        except Exception as exc:
+            reason = str(exc).replace("\n", " ").replace("\r", " ")
+            detail = (
+                f"previous_model=path={previous_model_path!r} exists=True "
+                f"fallback_reason={reason}"
+            )
+            self.logger.warning(
+                "incremental_checkpoint_decision mode=fresh_start_fallback_from_previous_model %s",
+                detail,
+            )
+            return None, "fresh_start_fallback_from_previous_model", detail
+
     def train_incremental(
         self,
         data: pd.DataFrame,
@@ -784,8 +829,20 @@ class IncrementalTrainer(CovariateTrainer):
                     "total_files": 0,
                 })
             else:
-                self.logger.info("Starting fresh training")
-                predictor = None
+                predictor, warm_start_mode, warm_start_detail = (
+                    self._resolve_warm_start_predictor(previous_model_path)
+                )
+                if warm_start_mode == "warm_start_from_previous_model":
+                    self.logger.info(
+                        "Starting training with warm-start predictor from previous model"
+                    )
+                else:
+                    self.logger.info("Starting fresh training")
+                    if warm_start_mode == "fresh_start_no_previous_model":
+                        self.logger.info(
+                            "incremental_checkpoint_decision mode=fresh_start_no_previous_model %s",
+                            warm_start_detail,
+                        )
                 training_state = {
                     "start_date": start_date,
                     "end_date": end_date,
@@ -810,13 +867,6 @@ class IncrementalTrainer(CovariateTrainer):
                     "(previous_model is ignored while resuming from checkpoint)",
                     last_checkpoint["year"],
                     last_checkpoint["month"],
-                    prev_desc,
-                )
-            else:
-                self.logger.info(
-                    "incremental_checkpoint_decision mode=fresh_start previous_model=%s "
-                    "warm_start_from_prior_run=not_implemented "
-                    "(first month still fits a new predictor; S3 --previous-model is unused here)",
                     prev_desc,
                 )
 

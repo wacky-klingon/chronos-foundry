@@ -719,6 +719,31 @@ class IncrementalTrainer(CovariateTrainer):
                     "total_files": 0,
                 }
 
+            if previous_model_path:
+                prev_desc = (
+                    f"path={previous_model_path!r} "
+                    f"exists={Path(previous_model_path).exists()}"
+                )
+            else:
+                prev_desc = "not_provided"
+
+            if last_checkpoint:
+                self.logger.info(
+                    "incremental_checkpoint_decision mode=resume_from_disk "
+                    "checkpoint_month=%04d-%02d previous_model=%s "
+                    "(previous_model is ignored while resuming from checkpoint)",
+                    last_checkpoint["year"],
+                    last_checkpoint["month"],
+                    prev_desc,
+                )
+            else:
+                self.logger.info(
+                    "incremental_checkpoint_decision mode=fresh_start previous_model=%s "
+                    "warm_start_from_prior_run=not_implemented "
+                    "(first month still fits a new predictor; S3 --previous-model is unused here)",
+                    prev_desc,
+                )
+
             # Initialize resumable loader
             resumable_loader = self._get_resumable_loader(checkpoint_manager)
 

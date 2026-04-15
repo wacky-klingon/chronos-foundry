@@ -7,6 +7,7 @@ Tests incremental training workflows, checkpointing, and resumable training.
 import pytest
 import tempfile
 import pandas as pd
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pathlib import Path
@@ -319,4 +320,87 @@ class TestIncrementalTrainer:
         trainer._apply_checkpoint_post_success_cleanup(cm)
 
         assert (ck / "temp").exists()
+
+    def test_evaluate_model_performance_marks_constant_validation_invalid(self, sample_config):
+        ts_module = pytest.importorskip("autogluon.timeseries")
+        trainer = IncrementalTrainer(sample_config)
+
+        timestamps = pd.date_range(start="2020-01-01", periods=80, freq="1h")
+        targets = np.concatenate((np.linspace(0.1, 0.2, 56), np.full(24, 0.1498844474554062)))
+        df = pd.DataFrame(
+            {
+                "item_id": "series_a",
+                "timestamp": timestamps,
+                "target": targets,
+            }
+        )
+        ts_df = ts_module.TimeSeriesDataFrame.from_data_frame(
+            df, id_column="item_id", timestamp_column="timestamp"
+        )
+
+        result = trainer._evaluate_model_performance(MagicMock(), ts_df)
+
+        assert result["validation_valid"] is False
+        assert result["validation_reason"] == "constant_validation_target"
+        assert result["mae"] is None
+        assert result["validation_summary"]["validation_rows"] == 24
+
+    def test_evaluate_model_performance_uses_per_series_holdout(self, sample_config):
+        ts_module = pytest.importorskip("autogluon.timeseries")
+        trainer = IncrementalTrainer(sample_config)
+
+        timestamps = pd.date_range(start="2020-01-01", periods=80, freq="1h")
+        df = pd.DataFrame(
+            {
+                "item_id": ["series_a"] * 80 + ["series_b"] * 80,
+                "timestamp": list(timestamps) + list(timestamps),
+                "target": np.concatenate(
+                    (
+                        np.linspace(0.10, 0.30, 80),
+                        np.linspace(0.40, 0.62, 80),
+                    )
+                ),
+            }
+        )
+        ts_df = ts_module.TimeSeriesDataFrame.from_data_frame(
+            df, id_column="item_id", timestamp_column="timestamp"
+        )
+
+        mock_predictor = MagicMock()
+        mock_predictor.predict.return_value = pd.DataFrame(
+            {"0.5": np.linspace(0.2, 0.4, 48)}
+        )
+
+        result = trainer._evaluate_model_performance(mock_predictor, ts_df)
+
+        assert result["validation_valid"] is True
+        assert result["validation_reason"] == "ok"
+        assert result["validation_summary"]["series_included"] == 2
+        assert result["validation_summary"]["validation_rows"] == 48
+        train_data = mock_predictor.predict.call_args.args[0]
+        assert len(train_data) == 112
+
+    def test_evaluate_model_performance_invalid_when_series_too_short(self, sample_config):
+        ts_module = pytest.importorskip("autogluon.timeseries")
+        trainer = IncrementalTrainer(sample_config)
+
+        timestamps = pd.date_range(start="2020-01-01", periods=40, freq="1h")
+        df = pd.DataFrame(
+            {
+                "item_id": "short_series",
+                "timestamp": timestamps,
+                "target": np.linspace(0.1, 0.3, 40),
+            }
+        )
+        ts_df = ts_module.TimeSeriesDataFrame.from_data_frame(
+            df, id_column="item_id", timestamp_column="timestamp"
+        )
+        mock_predictor = MagicMock()
+
+        result = trainer._evaluate_model_performance(mock_predictor, ts_df)
+
+        assert result["validation_valid"] is False
+        assert result["validation_reason"] == "insufficient_series_length"
+        assert result["validation_summary"]["series_included"] == 0
+        mock_predictor.predict.assert_not_called()
 

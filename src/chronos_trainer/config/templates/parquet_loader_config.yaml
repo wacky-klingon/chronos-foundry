@@ -1,0 +1,5 @@
+parquet_loader:
+  data_paths:
+    root_dir: "/path/to/parquet/root_dir"
+  schema:
+    datetime_column: "timestamp"

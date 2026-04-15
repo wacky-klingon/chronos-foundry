@@ -453,9 +453,25 @@ class IncrementalTrainer(CovariateTrainer):
                 f"Failed to load previous model from {model_path}: {e}"
             ) from e
 
+    def _invalid_validation_metrics(
+        self,
+        reason: str,
+        summary: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Build a consistent invalid-validation payload."""
+        return {
+            "mae": None,
+            "rmse": None,
+            "mase": None,
+            "directional_accuracy": None,
+            "validation_valid": False,
+            "validation_reason": reason,
+            "validation_summary": summary or {},
+        }
+
     def _evaluate_model_performance(
         self, predictor: TimeSeriesPredictor, data: TimeSeriesDataFrame
-    ) -> Dict[str, float]:
+    ) -> Dict[str, Any]:
         """Evaluate model performance using proper time series validation with detailed logging"""
         try:
             self.logger.info("=" * 80)
@@ -474,62 +490,104 @@ class IncrementalTrainer(CovariateTrainer):
                 self.logger.info(f"Target column stats:\n{target_stats}")
             else:
                 self.logger.warning("'target' column NOT found in TimeSeriesDataFrame")
-                return {
-                    "mae": float("inf"),
-                    "rmse": float("inf"),
-                    "mase": float("inf"),
-                    "directional_accuracy": 0.0,
-                }
+                return self._invalid_validation_metrics("missing_target_column")
 
-            # For time series, we need to use proper temporal validation
-            # Use the last prediction_length points for validation
+            # Build per-series temporal splits so each item_id contributes a holdout horizon.
             total_length = len(data)
             prediction_length = self.prediction_length
 
             self.logger.info(f"Total data length: {total_length}")
             self.logger.info(f"Prediction length: {prediction_length}")
 
-            if total_length < prediction_length * 2:
+            eval_df = data.reset_index()
+            if "item_id" not in eval_df.columns or "timestamp" not in eval_df.columns:
                 self.logger.warning(
-                    f"Insufficient data for proper evaluation. Need at least {prediction_length * 2}, got {total_length}"
+                    "TimeSeriesDataFrame reset_index missing required columns: item_id/timestamp"
                 )
-                return {
-                    "mae": 0.001,
-                    "rmse": 0.001,
-                    "mase": 0.001,
-                    "directional_accuracy": 0.5,
-                }
+                return self._invalid_validation_metrics("missing_index_columns")
 
-            # Use last prediction_length points as validation set
-            # Train on everything before that
-            train_data = data.iloc[:-prediction_length]
-            val_data = data.iloc[-prediction_length:]
+            series_count = eval_df["item_id"].nunique()
+            self.logger.info(f"Detected item_id series count: {series_count}")
+
+            min_series_len = prediction_length * 2
+            series_groups = eval_df.groupby("item_id", sort=False)
+            train_frames: List[pd.DataFrame] = []
+            val_frames: List[pd.DataFrame] = []
+            excluded_series = 0
+
+            for _, group_df in series_groups:
+                ordered = group_df.sort_values("timestamp")
+                if len(ordered) < min_series_len:
+                    excluded_series += 1
+                    continue
+                train_frames.append(ordered.iloc[:-prediction_length])
+                val_frames.append(ordered.iloc[-prediction_length:])
+
+            included_series = len(train_frames)
+            self.logger.info(
+                "Per-series split: included_series=%d excluded_series=%d min_required_length=%d",
+                included_series,
+                excluded_series,
+                min_series_len,
+            )
+
+            if included_series == 0:
+                self.logger.warning(
+                    "No series had enough rows for validation: required >= %d per item_id",
+                    min_series_len,
+                )
+                return self._invalid_validation_metrics(
+                    "insufficient_series_length",
+                    summary={
+                        "series_total": int(series_count),
+                        "series_included": 0,
+                        "series_excluded": int(excluded_series),
+                        "min_required_length": int(min_series_len),
+                    },
+                )
+
+            train_eval_df = pd.concat(train_frames, ignore_index=True)
+            val_eval_df = pd.concat(val_frames, ignore_index=True)
+            train_data = TimeSeriesDataFrame.from_data_frame(
+                train_eval_df, id_column="item_id", timestamp_column="timestamp"
+            )
+            val_data = TimeSeriesDataFrame.from_data_frame(
+                val_eval_df, id_column="item_id", timestamp_column="timestamp"
+            )
 
             self.logger.info(f"Train data length: {len(train_data)}")
             self.logger.info(f"Validation data length: {len(val_data)}")
+            self.logger.info(
+                "Validation timestamp bounds: %s -> %s",
+                val_eval_df["timestamp"].min(),
+                val_eval_df["timestamp"].max(),
+            )
 
             # Log validation data details
             val_target = val_data["target"].values
+            val_unique_count = len(np.unique(val_target))
             self.logger.info(
                 f"Validation target stats - min: {val_target.min():.6f}, max: {val_target.max():.6f}, mean: {val_target.mean():.6f}"
             )
-            self.logger.info(
-                f"Validation target unique values: {len(np.unique(val_target))}"
-            )
+            self.logger.info(f"Validation target unique values: {val_unique_count}")
             self.logger.info(f"Validation target sample: {val_target[:10]}")
 
             # Check if validation data is constant (data quality issue)
-            if len(np.unique(val_target)) == 1:
+            if val_unique_count == 1:
                 self.logger.warning(
                     "VALIDATION DATA IS CONSTANT! This indicates a data quality issue."
                 )
                 self.logger.warning(f"All validation values are: {val_target[0]}")
-                return {
-                    "mae": 0.0,  # Perfect prediction of constant
-                    "rmse": 0.0,
-                    "mase": 1.0,  # MASE = 1 when both model and naive are perfect
-                    "directional_accuracy": 1.0,  # No direction changes in constant data
-                }
+                return self._invalid_validation_metrics(
+                    "constant_validation_target",
+                    summary={
+                        "series_total": int(series_count),
+                        "series_included": int(included_series),
+                        "series_excluded": int(excluded_series),
+                        "validation_rows": int(len(val_data)),
+                        "constant_value": float(val_target[0]),
+                    },
+                )
 
             # Generate predictions for evaluation
             self.logger.info("Generating predictions...")
@@ -578,6 +636,15 @@ class IncrementalTrainer(CovariateTrainer):
             predicted_values = predicted_values[:min_len]
 
             self.logger.info(f"Aligned length: {min_len}")
+            if min_len == 0:
+                self.logger.warning("No overlapping rows between predictions and validation")
+                return self._invalid_validation_metrics(
+                    "empty_prediction_alignment",
+                    summary={
+                        "validation_rows": int(len(val_target)),
+                        "predicted_rows": int(len(predicted_values)),
+                    },
+                )
 
             # Calculate MAE
             errors = actual_values - predicted_values
@@ -624,13 +691,27 @@ class IncrementalTrainer(CovariateTrainer):
                 "rmse": float(rmse),
                 "mase": float(mase),
                 "directional_accuracy": float(directional_accuracy),
+                "validation_valid": True,
+                "validation_reason": "ok",
+                "validation_summary": {
+                    "series_total": int(series_count),
+                    "series_included": int(included_series),
+                    "series_excluded": int(excluded_series),
+                    "validation_rows": int(len(val_data)),
+                },
             }
 
             self.logger.info("=" * 80)
             self.logger.info("FINAL EVALUATION RESULTS")
             self.logger.info("=" * 80)
-            for metric, value in performance.items():
+            for metric in ("mae", "rmse", "mase", "directional_accuracy"):
+                value = performance.get(metric)
                 self.logger.info(f"{metric.upper()}: {value:.6f}")
+            self.logger.info(
+                "VALIDATION_STATUS: valid=%s reason=%s",
+                performance["validation_valid"],
+                performance["validation_reason"],
+            )
             self.logger.info("=" * 80)
 
             return performance
@@ -639,12 +720,7 @@ class IncrementalTrainer(CovariateTrainer):
             self.logger.error(
                 "Failed to evaluate model performance: %s\n%s", e, traceback.format_exc()
             )
-            return {
-                "mae": float("inf"),
-                "rmse": float("inf"),
-                "mase": float("inf"),
-                "directional_accuracy": 0.0,
-            }
+            return self._invalid_validation_metrics("evaluation_exception")
 
     def get_version_history(self) -> Dict[str, Any]:
         """Get complete version history and performance tracking"""
@@ -871,12 +947,19 @@ class IncrementalTrainer(CovariateTrainer):
                     predictor, validation_data
                 )
             else:
-                performance = {
-                    "mae": 0.0,
-                    "rmse": 0.0,
-                    "mase": 1.0,
-                    "directional_accuracy": 0.5,
-                }
+                self.logger.warning(
+                    "Validation data unavailable for %s to %s; final metrics marked invalid",
+                    validation_start_date,
+                    validation_end_date,
+                )
+                performance = self._invalid_validation_metrics("validation_data_unavailable")
+
+            if not performance.get("validation_valid", False):
+                self.logger.warning(
+                    "Training completed with invalid validation state: reason=%s summary=%s",
+                    performance.get("validation_reason"),
+                    performance.get("validation_summary"),
+                )
 
             # Save final model
             pf = training_state["processed_files"]
@@ -1190,7 +1273,7 @@ class IncrementalTrainer(CovariateTrainer):
         start_date: str,
         end_date: str,
         *,
-        performance: Optional[Dict[str, float]] = None,
+        performance: Optional[Dict[str, Any]] = None,
         checkpoint_dir: Optional[str] = None,
         last_year: Optional[int] = None,
         last_month: Optional[int] = None,
@@ -1266,6 +1349,12 @@ class IncrementalTrainer(CovariateTrainer):
                 "performance_metrics": performance or {},
                 "training_timestamp": datetime.now().isoformat(),
             }
+            if performance is not None:
+                metadata["validation"] = {
+                    "valid": bool(performance.get("validation_valid", False)),
+                    "reason": performance.get("validation_reason", "unknown"),
+                    "summary": performance.get("validation_summary", {}),
+                }
             metadata_path = version_dir / "training_metadata.json"
             with open(metadata_path, "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2)

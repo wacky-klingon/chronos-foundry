@@ -1,0 +1,12 @@
+incremental_training:
+  chronos_only: true
+  chronos_model_variant: "bolt_small"
+  checkpoint_dir: "/path/to/checkpoints"
+  model_base_path: "/path/to/model/output"
+  performance_threshold: 0.05
+  rollback_enabled: true
+  rollback_window_versions: 1
+  checkpoint_post_success_cleanup: false
+  lookback_days: 90
+  excluded_model_types: []
+  min_free_bytes: 1073741824

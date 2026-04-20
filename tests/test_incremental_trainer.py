@@ -6,6 +6,7 @@ Tests incremental training workflows, checkpointing, and resumable training.
 
 import pytest
 import tempfile
+import json
 import pandas as pd
 import numpy as np
 import pyarrow as pa
@@ -243,6 +244,63 @@ class TestIncrementalTrainer:
                 # Should have processed February (file 2)
                 progress = checkpoint_manager.get_training_progress()
                 assert progress["status"] == "in_progress" or progress["total_checkpoints"] >= 1
+
+    def test_final_model_metadata_contains_fine_tune_verification(
+        self, temp_dir, sample_config
+    ):
+        trainer = IncrementalTrainer(sample_config)
+        predictor = MagicMock()
+        source_dir = Path(
+            _minimal_autogluon_predictor_dir(
+                Path(temp_dir), min_total_bytes=_MIN_FINAL_MODEL_BYTES
+            )
+        )
+        predictor.path = str(source_dir)
+        checkpoint_dir = Path(temp_dir) / "checkpoint_copy"
+        checkpoint_model_dir = checkpoint_dir / "model_checkpoints" / "model_2020_02"
+        checkpoint_model_dir.mkdir(parents=True, exist_ok=True)
+        for item in source_dir.iterdir():
+            dest = checkpoint_model_dir / item.name
+            if item.is_dir():
+                shutil.copytree(item, dest, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dest)
+        verification_state = {
+            "row_count": 200,
+            "item_ids": ["item_a", "item_b"],
+            "observed_start_timestamp": "2020-01-01T00:00:00",
+            "observed_end_timestamp": "2020-02-29T23:00:00",
+            "known_covariates": ["gold_xauusd_bid"],
+            "fit_runtime_seconds": 45.0,
+            "processed_files": [{"year": 2020, "month": 1}, {"year": 2020, "month": 2}],
+        }
+
+        model_path = trainer._save_final_model(
+            Path(sample_config["model_path"]),
+            predictor,
+            "2020-01-01",
+            "2020-02-29",
+            performance={
+                "validation_valid": True,
+                "validation_reason": "ok",
+                "validation_summary": {"validation_rows": 24},
+            },
+            checkpoint_dir=str(checkpoint_dir),
+            last_year=2020,
+            last_month=2,
+            verification_state=verification_state,
+        )
+
+        metadata_path = Path(model_path) / "training_metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        verification = metadata["fine_tune_verification"]
+        assert verification["dataset_fingerprint"]["row_count"] == 200
+        assert verification["dataset_fingerprint"]["item_count"] == 2
+        assert verification["training_run"]["fit_runtime_seconds"] == 45.0
+        assert (
+            verification["training_run"]["requested_hyperparameters"]["learning_rate"]
+            == 0.001
+        )
 
     @patch("chronos_trainer.training.checkpoint_manager.TimeSeriesPredictor.load")
     def test_no_remaining_files(

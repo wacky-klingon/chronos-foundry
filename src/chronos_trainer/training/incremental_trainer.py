@@ -3,6 +3,7 @@ Incremental trainer for continuous model improvement with versioning and rollbac
 """
 
 import json
+import hashlib
 import pandas as pd
 import numpy as np
 import shutil
@@ -85,6 +86,75 @@ class IncrementalTrainer(CovariateTrainer):
         }
         self.versioning = ModelVersioning(versioning_config)
         self._resumable_loader: Optional[Any] = None
+
+    def _get_fine_tune_verification_settings(self) -> Dict[str, Any]:
+        raw_settings = self.incremental_config.get("fine_tune_verification", {})
+        settings = dict(raw_settings) if isinstance(raw_settings, dict) else {}
+        settings.setdefault("enabled", True)
+        settings.setdefault("min_fit_runtime_seconds", 30.0)
+        settings.setdefault("allow_constant_validation_target", False)
+        return settings
+
+    def _new_verification_state(self) -> Dict[str, Any]:
+        return {
+            "row_count": 0,
+            "item_ids": [],
+            "observed_start_timestamp": None,
+            "observed_end_timestamp": None,
+            "known_covariates": [],
+            "fit_runtime_seconds": 0.0,
+            "processed_files": [],
+        }
+
+    def _update_verification_state(
+        self, verification_state: Dict[str, Any], df: pd.DataFrame, fit_time_s: float
+    ) -> None:
+        timestamp_col = self.config.get("timestamp_col", "timestamp")
+        item_id_col = self.config.get("item_id_col", "item_id")
+        known_covariates = self.incremental_config.get("known_covariates", [])
+
+        verification_state["row_count"] = int(
+            verification_state.get("row_count", 0) + len(df)
+        )
+
+        seen_item_ids = set(verification_state.get("item_ids", []))
+        if item_id_col in df.columns:
+            seen_item_ids.update(str(value) for value in df[item_id_col].dropna().unique())
+        verification_state["item_ids"] = sorted(seen_item_ids)
+
+        if timestamp_col in df.columns and not df.empty:
+            current_start = pd.to_datetime(df[timestamp_col]).min().isoformat()
+            current_end = pd.to_datetime(df[timestamp_col]).max().isoformat()
+            existing_start = verification_state.get("observed_start_timestamp")
+            existing_end = verification_state.get("observed_end_timestamp")
+            if existing_start is None or current_start < existing_start:
+                verification_state["observed_start_timestamp"] = current_start
+            if existing_end is None or current_end > existing_end:
+                verification_state["observed_end_timestamp"] = current_end
+
+        seen_covariates = set(verification_state.get("known_covariates", []))
+        seen_covariates.update(col for col in known_covariates if col in df.columns)
+        verification_state["known_covariates"] = sorted(seen_covariates)
+        verification_state["fit_runtime_seconds"] = round(
+            float(verification_state.get("fit_runtime_seconds", 0.0)) + float(fit_time_s),
+            6,
+        )
+
+    def _build_dataset_fingerprint(
+        self, verification_state: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        fingerprint_payload = {
+            "row_count": int(verification_state.get("row_count", 0)),
+            "item_count": len(verification_state.get("item_ids", [])),
+            "observed_start_timestamp": verification_state.get("observed_start_timestamp"),
+            "observed_end_timestamp": verification_state.get("observed_end_timestamp"),
+            "target_col": self.config.get("target_col", "target"),
+            "known_covariates": sorted(verification_state.get("known_covariates", [])),
+        }
+        fingerprint_payload["fingerprint_hash"] = hashlib.sha256(
+            json.dumps(fingerprint_payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return fingerprint_payload
 
     def _get_required_rollback_window_versions(self) -> int:
         """Read required rollback window retention from config with no defaults."""
@@ -852,6 +922,11 @@ class IncrementalTrainer(CovariateTrainer):
                     "total_files": 0,
                 }
 
+            verification_state = training_state.get("verification_state")
+            if not isinstance(verification_state, dict):
+                verification_state = self._new_verification_state()
+                training_state["verification_state"] = verification_state
+
             if previous_model_path:
                 prev_desc = (
                     f"path={previous_model_path!r} "
@@ -938,6 +1013,7 @@ class IncrementalTrainer(CovariateTrainer):
 
                 # Get data stats
                 data_stats = resumable_loader.get_data_stats(df)
+                self._update_verification_state(verification_state, df, train_time_s)
 
                 # Update training state
                 training_state["processed_files"].append(
@@ -947,6 +1023,9 @@ class IncrementalTrainer(CovariateTrainer):
                         "month": month,
                         "record_count": len(df),
                     }
+                )
+                verification_state["processed_files"] = list(
+                    training_state["processed_files"]
                 )
 
                 # Save checkpoint
@@ -1023,6 +1102,7 @@ class IncrementalTrainer(CovariateTrainer):
                 checkpoint_dir=checkpoint_dir,
                 last_year=last["year"] if last else None,
                 last_month=last["month"] if last else None,
+                verification_state=verification_state,
             )
             if not final_model_path:
                 return {
@@ -1327,6 +1407,7 @@ class IncrementalTrainer(CovariateTrainer):
         checkpoint_dir: Optional[str] = None,
         last_year: Optional[int] = None,
         last_month: Optional[int] = None,
+        verification_state: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Save final trained model to model_path with training_metadata.json."""
         try:
@@ -1405,6 +1486,34 @@ class IncrementalTrainer(CovariateTrainer):
                     "reason": performance.get("validation_reason", "unknown"),
                     "summary": performance.get("validation_summary", {}),
                 }
+            verification_state = verification_state or self._new_verification_state()
+            metadata["fine_tune_verification"] = {
+                "settings": self._get_fine_tune_verification_settings(),
+                "dataset_fingerprint": self._build_dataset_fingerprint(
+                    verification_state
+                ),
+                "training_run": {
+                    "selected_model": (
+                        "Chronos[autogluon__chronos-"
+                        f"{self.chronos_variant.replace('_', '-')}]"
+                    ),
+                    "chronos_model_path": self.chronos_model_path,
+                    "fit_runtime_seconds": round(
+                        float(verification_state.get("fit_runtime_seconds", 0.0)),
+                        6,
+                    ),
+                    "processed_file_count": len(
+                        verification_state.get("processed_files", [])
+                    ),
+                    "requested_hyperparameters": {
+                        "learning_rate": self.learning_rate,
+                        "max_epochs": self.max_epochs,
+                        "batch_size": self.batch_size,
+                        "context_length": self.context_length,
+                        "device": self.device,
+                    },
+                },
+            }
             metadata_path = version_dir / "training_metadata.json"
             with open(metadata_path, "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2)

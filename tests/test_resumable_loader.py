@@ -121,24 +121,34 @@ class TestResumableDataLoader:
         remaining = loader.get_remaining_files("2020-01-01", "2020-02-28")
         assert len(remaining) == 2, "All files should be remaining initially"
 
-        # Save a checkpoint for 2020-01
-        mock_predictor = MagicMock()
-        mock_predictor.path = None
-        mock_predictor.save = MagicMock()
+        # CheckpointManager.save_checkpoint copies from predictor.path and validates artifacts.
+        fake_model = tempfile.mkdtemp()
+        try:
+            root = Path(fake_model)
+            (root / "models").mkdir(parents=True)
+            (root / "predictor.pkl").touch()
+            (root / "learner.pkl").touch()
+            (root / "models" / "trainer.pkl").touch()
 
-        checkpoint_manager.save_checkpoint(
-            year=2020,
-            month=1,
-            model=mock_predictor,
-            data_stats={"record_count": 100},
-            training_state={
-                "start_date": "2020-01-01",
-                "end_date": "2020-02-28",
-                "processed_files": [
-                    {"file_path": "data.parquet", "year": 2020, "month": 1}
-                ],
-            },
-        )
+            mock_predictor = MagicMock()
+            mock_predictor.path = fake_model
+            mock_predictor.save = MagicMock()
+
+            checkpoint_manager.save_checkpoint(
+                year=2020,
+                month=1,
+                model=mock_predictor,
+                data_stats={"record_count": 100},
+                training_state={
+                    "start_date": "2020-01-01",
+                    "end_date": "2020-02-28",
+                    "processed_files": [
+                        {"file_path": "data.parquet", "year": 2020, "month": 1}
+                    ],
+                },
+            )
+        finally:
+            shutil.rmtree(fake_model, ignore_errors=True)
 
         # Now only 2020-02 should be remaining
         remaining = loader.get_remaining_files("2020-01-01", "2020-02-28")

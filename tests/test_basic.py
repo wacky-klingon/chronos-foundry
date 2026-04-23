@@ -346,12 +346,14 @@ class TestModelVersioning:
         """Test model versioning can be created"""
         from chronos_trainer.training import ModelVersioning
 
-        config = {
-            'data': {'output_dir': '/tmp/test_models'}
-        }
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "model_path": tmp,
+                "max_versions": 5,
+            }
 
-        versioning = ModelVersioning(config)
-        assert versioning is not None
+            versioning = ModelVersioning(config)
+            assert versioning is not None
 
 
 # Test configuration for pytest

@@ -100,22 +100,33 @@ class CentralConfigProvider:
     ):
         """Helper function to get merged configuration for different training types"""
         # Get base configurations
-        chronos_config = self.get_config_section("train")["chronos_model"]
+        train_section = self.get_config_section("train")
+        chronos_config = train_section["chronos_model"]
+        train_data_config = train_section.get("data", {})
+        train_runtime_config = train_section.get("train", {})
 
         # Always use parquet loader config - fail fast if not available
         parquet_config = self.get_config_section("parquet_loader_config")[
             "parquet_loader"
         ]
         data_config = {
-            "timestamp_col": parquet_config["schema"]["datetime_column"],
-            "target_col": "target",  # Use primary target column as per documentation
-            "item_id_col": "item_id",  # Default item ID column
+            "timestamp_col": train_data_config.get(
+                "timestamp_col", parquet_config["schema"]["datetime_column"]
+            ),
+            "target_col": train_data_config.get("target_col", "target_close"),
+            "item_id_col": train_data_config.get("item_id_col", "item_id"),
         }
 
         full_config = {
             **data_config,
             **chronos_config,
         }
+
+        if train_runtime_config:
+            full_config["train_runtime"] = train_runtime_config
+
+        if train_data_config:
+            full_config["data_config"] = train_data_config
 
         # Add parquet loader configuration if available
         try:

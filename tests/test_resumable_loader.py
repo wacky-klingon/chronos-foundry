@@ -178,3 +178,25 @@ class TestResumableDataLoader:
         # Without checkpoint manager, should return all files
         assert len(remaining) == 2
 
+    def test_convert_drops_legacy_target_when_mapping_target_close(self, tmp_path):
+        """Parquet may carry both target_close and a legacy target; avoid duplicate label."""
+        loader = ResumableDataLoader(str(tmp_path))
+        df = pd.DataFrame(
+            {
+                "ds": pd.date_range("2020-01-01", periods=5, freq="h"),
+                "item_id": ["USDCAD"] * 5,
+                "target_close": [1.1, 1.2, 1.3, 1.4, 1.5],
+                "target": [0.0, 0.0, 1.0, 0.0, 0.0],
+            }
+        )
+        ts_df = loader.convert_to_timeseries_dataframe(
+            df,
+            {
+                "timestamp_col": "ds",
+                "target_col": "target_close",
+                "item_id_col": "item_id",
+            },
+        )
+        assert ts_df is not None
+        assert list(ts_df.columns).count("target") == 1
+

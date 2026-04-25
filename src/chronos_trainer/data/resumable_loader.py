@@ -20,6 +20,87 @@ except ImportError:
     logging.warning("AutoGluon not available - TimeSeriesDataFrame conversion will fail")
 
 
+def _autogluon_timeseries_package_version() -> str:
+    try:
+        import importlib.metadata as im
+
+        return im.version("autogluon.timeseries")
+    except Exception:
+        return "unknown"
+
+
+def log_autogluon_timeseries_dataframe_probe(
+    ts_df: Any,
+    logger: Any,
+    *,
+    phase: str,
+) -> None:
+    """Diagnostics for AutoGluon TimeSeriesPredictor.fit dtype / column-layout failures.
+
+    ``TimeSeriesPredictor._check_and_prepare_data_frame`` expects ``df['target']`` to
+    behave like a Series (``.dtype``, ``is_numeric_dtype``). A column slice that stays a
+    ``TimeSeriesDataFrame`` breaks that path on some pandas + AutoGluon combinations.
+    """
+    if ts_df is None:
+        logger.info("autogluon_tsdf_probe phase=%s skipped (ts_df is None)", phase)
+        return
+
+    col_list = list(ts_df.columns)
+    target_name_count = sum(1 for c in col_list if c == "target")
+    dup_any = bool(ts_df.columns.duplicated().any())
+    dup_sum = int(ts_df.columns.duplicated().sum())
+
+    logger.info(
+        "autogluon_tsdf_probe phase=%s pandas=%s autogluon_timeseries=%s ts_df_type=%s "
+        "n_rows=%s n_cols=%s dup_labels=%s dup_label_count=%s columns=%s",
+        phase,
+        pd.__version__,
+        _autogluon_timeseries_package_version(),
+        type(ts_df).__name__,
+        len(ts_df),
+        len(col_list),
+        dup_any,
+        dup_sum,
+        col_list,
+    )
+
+    if target_name_count != 1 or dup_any:
+        logger.warning(
+            "more than one column is named target (or an odd column layout). phase=%s "
+            "target_name_count=%s duplicate_column_labels=%s columns=%s",
+            phase,
+            target_name_count,
+            dup_any,
+            col_list,
+        )
+
+    try:
+        target_sel = ts_df["target"]
+        has_dtype_attr = hasattr(target_sel, "dtype")
+        dtype_val = getattr(target_sel, "dtype", None)
+        is_numeric = (
+            pd.api.types.is_numeric_dtype(target_sel)
+            if has_dtype_attr
+            else None
+        )
+        logger.info(
+            "autogluon_tsdf_probe phase=%s materialize_workaround_context: "
+            "type(ts_df['target'])=%s has_dtype=%s dtype=%s is_numeric_dtype=%s "
+            "(re-wrap via pd.DataFrame may not change this if slice stays a subclass)",
+            phase,
+            type(target_sel).__name__,
+            has_dtype_attr,
+            dtype_val,
+            is_numeric,
+        )
+    except Exception as exc:
+        logger.warning(
+            "autogluon_tsdf_probe phase=%s target_slice_probe_failed err=%s",
+            phase,
+            exc,
+        )
+
+
 class ResumableDataLoader:
     """
     Loads parquet files organized in YYYY/MM/ directory structure with checkpoint support.
@@ -245,7 +326,7 @@ class ResumableDataLoader:
             # Map target column
             if target_col not in df.columns:
                 # Try common aliases
-                for alias in ["value", "target", "y"]:
+                for alias in ["target_close", "value", "target", "y"]:
                     if alias in df.columns:
                         column_mapping[alias] = "target"
                         target_col = "target"
@@ -271,6 +352,20 @@ class ResumableDataLoader:
                 column_mapping[item_id_col] = "item_id"
                 item_id_col = "item_id"
 
+            # Parquet schemas may include both `target_close` (canonical) and a legacy `target`
+            # column. Renaming the configured column to "target" would otherwise yield duplicate
+            # labels and break AutoGluon (df["target"] is not a single Series).
+            sources_mapped_to_target = [k for k, v in column_mapping.items() if v == "target"]
+            if sources_mapped_to_target:
+                src_for_target = sources_mapped_to_target[0]
+                if "target" in df.columns and src_for_target != "target":
+                    self.logger.warning(
+                        "Dropping existing column 'target' so configured source %r can rename to "
+                        "'target' without duplicate column labels.",
+                        src_for_target,
+                    )
+                    df = df.drop(columns=["target"])
+
             # Apply column mappings
             if column_mapping:
                 df = df.rename(columns=column_mapping)
@@ -286,9 +381,24 @@ class ResumableDataLoader:
             if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
                 df["timestamp"] = pd.to_datetime(df["timestamp"])
 
+            pre_cols = list(df.columns)
+            pre_target_count = pre_cols.count("target")
+            if pre_target_count != 1 or df.columns.duplicated().any():
+                self.logger.warning(
+                    "more than one column is named target (or an odd column layout). "
+                    "phase=long_df_pre_from_data_frame target_name_count=%s "
+                    "duplicate_labels=%s columns=%s",
+                    pre_target_count,
+                    bool(df.columns.duplicated().any()),
+                    pre_cols,
+                )
+
             # Create TimeSeriesDataFrame
             ts_df = TimeSeriesDataFrame.from_data_frame(
                 df, id_column="item_id", timestamp_column="timestamp"
+            )
+            log_autogluon_timeseries_dataframe_probe(
+                ts_df, self.logger, phase="convert_post_from_data_frame"
             )
 
             self.logger.info(

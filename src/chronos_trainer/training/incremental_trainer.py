@@ -27,6 +27,7 @@ from .covariate_trainer import CovariateTrainer
 from .model_versioning import ModelVersioning
 from .checkpoint_manager import CheckpointManager
 from ..core.config_helpers import ConfigHelpers
+from ..data.resumable_loader import log_autogluon_timeseries_dataframe_probe
 
 
 class IncrementalTrainingError(Exception):
@@ -1209,6 +1210,12 @@ class IncrementalTrainer(CovariateTrainer):
         Path(temp_base).mkdir(parents=True, exist_ok=True)
         temp_model_path = f"{temp_base}/temp_model_{year:04d}_{month:02d}"
 
+        log_autogluon_timeseries_dataframe_probe(
+            ts_df,
+            self.logger,
+            phase=f"_train_predictor_pre_fit y={year:04d} m={month:02d} branch=initial",
+        )
+
         known_covariates = self.incremental_config.get("known_covariates", [])
         lookback_days = self.incremental_config.get("lookback_days")
         chronos_hyperparameters = self._get_chronos_hyperparameters()
@@ -1219,8 +1226,9 @@ class IncrementalTrainer(CovariateTrainer):
 
         if previous_predictor is None:
             # First file - create new predictor
+            # ResumableDataLoader maps config target_col (e.g. target_close) to column "target".
             predictor = TimeSeriesPredictor(
-                target=self.config.get("target_col", "target"),
+                target="target",
                 prediction_length=self.prediction_length,
                 known_covariates_names=known_covariates,
                 path=temp_model_path,
@@ -1294,9 +1302,15 @@ class IncrementalTrainer(CovariateTrainer):
             else:
                 combined_data = ts_df
 
-            # Create new predictor for combined data
+            log_autogluon_timeseries_dataframe_probe(
+                combined_data,
+                self.logger,
+                phase=f"_train_predictor_pre_fit y={year:04d} m={month:02d} branch=combined_window",
+            )
+
+            # ResumableDataLoader maps config target_col (e.g. target_close) to column "target".
             predictor = TimeSeriesPredictor(
-                target=self.config.get("target_col", "target"),
+                target="target",
                 prediction_length=self.prediction_length,
                 known_covariates_names=known_covariates,
                 path=temp_model_path,

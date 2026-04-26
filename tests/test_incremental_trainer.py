@@ -117,6 +117,10 @@ class TestIncrementalTrainer:
             "incremental_training": {
                 "chronos_only": True,
                 "chronos_model_variant": "bolt_small",
+                # Points to the temp directory itself — satisfies the path-existence
+                # check in _resolve_chronos_local_model_path() without requiring real
+                # model weights. Tests that mock _train_predictor never reach AutoGluon.
+                "chronos_local_model_dir": temp_dir,
                 "model_versioning": True,
                 "performance_threshold": 0.05,
                 "rollback_enabled": True,

@@ -132,6 +132,31 @@ class ChronosTrainer:
 
         self.logger.info("Training device resolved to: %s", self.device)
 
+    def preprocess_raw_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Hook for subclass-level feature engineering on the raw parquet DataFrame.
+
+        Called by the incremental training loop after each parquet file is loaded
+        and before the DataFrame is converted to a TimeSeriesDataFrame. The base
+        implementation is a no-op and returns the input unchanged.
+
+        Subclasses must override this method to inject domain-specific feature
+        engineering. The contract is:
+
+        - Accept the raw DataFrame as loaded from parquet.
+        - Return a DataFrame with the same index and at least the same columns.
+        - Never raise from within the override; log a WARNING and return the
+          input unchanged if prerequisite columns are absent.
+        - Do not perform I/O or modify any shared state.
+
+        Args:
+            df: Raw pandas DataFrame as loaded by ResumableDataLoader.
+
+        Returns:
+            The input DataFrame, optionally enriched with additional columns.
+        """
+        return df
+
     def prepare_timeseries_dataframe(self, df: pd.DataFrame) -> TimeSeriesDataFrame:
         """Convert pandas DataFrame to AutoGluon TimeSeriesDataFrame"""
         try:

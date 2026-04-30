@@ -87,6 +87,7 @@ class IncrementalTrainer(CovariateTrainer):
         settings.setdefault("enabled", True)
         settings.setdefault("min_fit_runtime_seconds", 30.0)
         settings.setdefault("allow_constant_validation_target", False)
+        settings.setdefault("allow_covariate_evaluation_skip", False)
         return settings
 
     def _new_verification_state(self) -> Dict[str, Any]:
@@ -226,18 +227,78 @@ class IncrementalTrainer(CovariateTrainer):
                 "Mixed-model incremental training is not supported."
             )
 
+    def _get_fine_tune_config(self) -> Dict[str, Any]:
+        """Return the fine_tune sub-block from incremental_training config with defaults."""
+        raw = self.incremental_config.get("fine_tune", {})
+        cfg = dict(raw) if isinstance(raw, dict) else {}
+        cfg.setdefault("enabled", True)
+        cfg.setdefault("learning_rate", 1e-5)
+        cfg.setdefault("steps", 200)
+        cfg.setdefault("batch_size", 8)
+        return cfg
+
     def _get_chronos_hyperparameters(self) -> Dict[str, Dict[str, Any]]:
-        """Build Chronos-only hyperparameters for TimeSeriesPredictor.fit."""
-        return {
-            "Chronos": {
-                "model_path": self.chronos_model_path,
-                "context_length": self.context_length,
-                "learning_rate": self.learning_rate,
-                "batch_size": self.batch_size,
-                "max_epochs": self.max_epochs,
-                "device": self.device,
-            }
+        """Build Chronos-only hyperparameters for TimeSeriesPredictor.fit.
+
+        The fine_tune keys are required for AutoGluon's Chronos backend to perform
+        real fine-tuning and write a fine-tuned-ckpt directory.  Without them,
+        AutoGluon runs in zero-shot mode and produces only pickle artifacts, which
+        causes safetensors export to fail with no checkpoint found.
+        """
+        ft = self._get_fine_tune_config()
+        params: Dict[str, Any] = {
+            "model_path": self.chronos_model_path,
+            "context_length": self.context_length,
+            "learning_rate": self.learning_rate,
+            "batch_size": self.batch_size,
+            "max_epochs": self.max_epochs,
+            "device": self.device,
+            "fine_tune": ft["enabled"],
+            "fine_tune_lr": ft["learning_rate"],
+            "fine_tune_steps": ft["steps"],
+            "fine_tune_batch_size": ft["batch_size"],
         }
+        return {"Chronos": params}
+
+    def _assert_fine_tuned_checkpoint_exists(self, predictor_path: Path) -> None:
+        """Raise IncrementalTrainingError if fine-tuning was requested but AutoGluon
+        did not produce a fine-tuned-ckpt directory under predictor_path/models/.
+
+        A missing checkpoint means AutoGluon ran in zero-shot mode despite receiving
+        fine_tune: true, which will cause safetensors export to fail downstream.
+        Failing here with diagnostics is cheaper than running the rest of the pipeline
+        against an incomplete artifact.
+        """
+        ft = self._get_fine_tune_config()
+        if not ft.get("enabled", True):
+            return
+
+        models_dir = predictor_path / "models"
+        if not models_dir.exists():
+            discovered: List[str] = []
+        else:
+            discovered = sorted(
+                str(p.relative_to(predictor_path))
+                for p in models_dir.rglob("*")
+                if p.is_dir()
+            )
+
+        ckpt_dirs = [d for d in discovered if "fine-tuned-ckpt" in d]
+        if ckpt_dirs:
+            self.logger.info(
+                "fine-tuned-ckpt confirmed at: %s",
+                ckpt_dirs,
+            )
+            return
+
+        raise IncrementalTrainingError(
+            "fine_tune is enabled but no fine-tuned-ckpt directory was found under "
+            f"{predictor_path / 'models'}. AutoGluon may have silently fallen back to "
+            "zero-shot mode. Discovered model subdirectories: "
+            + (", ".join(discovered) if discovered else "(none)")
+            + ". Check that fine_tune_lr, fine_tune_steps, and fine_tune_batch_size "
+            "are accepted by the installed AutoGluon version."
+        )
 
     def _log_artifact_event(self, event: str, **fields: Any) -> None:
         """Structured artifact lifecycle logging for pointer/debug diagnostics."""
@@ -495,9 +556,31 @@ class IncrementalTrainer(CovariateTrainer):
             # Generate predictions for evaluation
             self.logger.info("Generating predictions...")
             known_covariates_names = self.incremental_config.get("known_covariates", [])
-            if known_covariates_names and all(
-                c in val_data.columns for c in known_covariates_names
-            ):
+            missing_covariates = [
+                c for c in known_covariates_names if c not in val_data.columns
+            ]
+            if known_covariates_names and missing_covariates:
+                # The predictor was trained with known_covariates but the validation
+                # parquet data is raw (engineered features not recomputed at eval time).
+                # Calling predict without covariates would raise ValueError from AutoGluon.
+                # Return a named reason so the caller can allow this via config rather
+                # than silently catching a generic evaluation_exception.
+                self.logger.warning(
+                    "Evaluation skipped: predictor requires %d known covariate(s) "
+                    "that are absent from the validation data. "
+                    "Missing: %s",
+                    len(missing_covariates),
+                    missing_covariates,
+                )
+                return self._invalid_validation_metrics(
+                    "evaluation_skipped_covariates_not_in_validation_data",
+                    summary={
+                        "required_covariates": len(known_covariates_names),
+                        "missing_covariates": missing_covariates,
+                        "validation_rows": int(len(val_data)),
+                    },
+                )
+            if known_covariates_names:
                 known_cov_df = val_data[known_covariates_names]
                 predictions = predictor.predict(
                     train_data, known_covariates=known_cov_df
@@ -910,7 +993,7 @@ class IncrementalTrainer(CovariateTrainer):
                 "status": "completed",
                 "message": "Resumable training completed successfully",
                 "checkpoint_dir": checkpoint_dir,
-                "final_model_path": final_model_path,
+                "model_path": final_model_path,
                 "performance": performance,
                 "processed_files": len(training_state["processed_files"]),
                 "total_files": training_state["total_files"],
@@ -1121,6 +1204,7 @@ class IncrementalTrainer(CovariateTrainer):
             fit_time_s = time.perf_counter() - fit_start_time
 
         self.logger.info("predictor.fit() time for %04d-%02d: %.3fs", year, month, fit_time_s)
+        self._assert_fine_tuned_checkpoint_exists(Path(temp_model_path))
         return predictor, fit_time_s
 
     def _load_validation_data(

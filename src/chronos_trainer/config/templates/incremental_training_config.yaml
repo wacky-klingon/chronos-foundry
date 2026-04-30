@@ -10,3 +10,16 @@ incremental_training:
   lookback_days: 90
   excluded_model_types: []
   min_free_bytes: 1073741824
+  # Chronos fine-tune hyperparameters passed directly to AutoGluon's Chronos backend.
+  # Without fine_tune: true, AutoGluon treats the run as zero-shot and never writes
+  # a fine-tuned-ckpt directory, so safetensors export will always fail.
+  fine_tune:
+    enabled: true
+    learning_rate: 0.00001   # fine_tune_lr passed to Chronos hyperparameters
+    steps: 200               # fine_tune_steps passed to Chronos hyperparameters
+    batch_size: 8            # fine_tune_batch_size passed to Chronos hyperparameters
+  fine_tune_verification:
+    enabled: true
+    min_fit_runtime_seconds: 30.0
+    allow_constant_validation_target: false
+    allow_covariate_evaluation_skip: false

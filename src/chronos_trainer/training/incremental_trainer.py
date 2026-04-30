@@ -361,11 +361,25 @@ class IncrementalTrainer(CovariateTrainer):
         """Ensure model_path is configured and available. Raises if not."""
         return self._ensure_path_available(model_path, "model_path")
 
+    @staticmethod
+    def _candidate_has_safetensors(path: Path) -> bool:
+        """Return True if path contains a valid top-level safetensors/ export."""
+        return (
+            (path / "safetensors" / "config.json").exists()
+            and (path / "safetensors" / "model.safetensors").exists()
+        )
+
     def _resolve_warm_start_predictor(
         self, previous_model_path: Optional[str]
     ) -> Tuple[Optional[TimeSeriesPredictor], str, str]:
         """
         Resolve best-effort warm start predictor for checkpoint training.
+
+        Warm-start eligibility now requires a safetensors-verified artifact.
+        If the candidate exists but is missing top-level safetensors artifacts,
+        the predictor is still loaded (migration compatibility) but the mode is
+        logged as ``warm_start_fallback_legacy_predictor`` rather than
+        ``warm_start_from_safetensors_verified``.
 
         Returns:
             (predictor, mode_token, detail)
@@ -386,18 +400,35 @@ class IncrementalTrainer(CovariateTrainer):
             )
             return None, "fresh_start_fallback_from_previous_model", detail
 
+        has_safetensors = self._candidate_has_safetensors(path)
+        if has_safetensors:
+            warm_start_mode = "warm_start_from_safetensors_verified"
+        else:
+            warm_start_mode = "warm_start_fallback_legacy_predictor"
+            self.logger.warning(
+                "incremental_checkpoint_decision mode=warm_start_fallback_legacy_predictor "
+                "previous_model=path=%r safetensors_missing=True "
+                "(proceeding with legacy predictor load; re-run with updated wrapper to satisfy contract)",
+                previous_model_path,
+            )
+
         try:
             predictor = self._load_previous_model(str(path))
-            detail = f"previous_model=path={previous_model_path!r} exists=True"
+            detail = (
+                f"previous_model=path={previous_model_path!r} exists=True "
+                f"safetensors_verified={has_safetensors}"
+            )
             self.logger.info(
-                "incremental_checkpoint_decision mode=warm_start_from_previous_model %s",
+                "incremental_checkpoint_decision mode=%s %s",
+                warm_start_mode,
                 detail,
             )
-            return predictor, "warm_start_from_previous_model", detail
+            return predictor, warm_start_mode, detail
         except Exception as exc:
             reason = str(exc).replace("\n", " ").replace("\r", " ")
             detail = (
                 f"previous_model=path={previous_model_path!r} exists=True "
+                f"safetensors_verified={has_safetensors} "
                 f"fallback_reason={reason}"
             )
             self.logger.warning(

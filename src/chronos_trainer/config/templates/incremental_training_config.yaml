@@ -7,6 +7,9 @@ incremental_training:
   rollback_enabled: true
   rollback_window_versions: 1
   checkpoint_post_success_cleanup: false
+  # Maximum number of model_checkpoints/ dirs to retain on disk during training.
+  # Pruning occurs after every successful monthly checkpoint save.
+  max_model_checkpoints: 2
   lookback_days: 90
   excluded_model_types: []
   min_free_bytes: 1073741824

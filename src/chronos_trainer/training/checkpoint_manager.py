@@ -21,12 +21,14 @@ from autogluon.timeseries import TimeSeriesPredictor
 class CheckpointManager:
     """Manages checkpoints for resumable training"""
 
-    def __init__(self, checkpoint_dir: str):
+    def __init__(self, checkpoint_dir: str, max_model_checkpoints: Optional[int] = None):
         """
         Initialize checkpoint manager
 
         Args:
             checkpoint_dir: Directory to store checkpoints
+            max_model_checkpoints: If set, prune model_checkpoints/ to this many
+                dirs after every successful save. Must be >= 1 when provided.
         """
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -37,12 +39,15 @@ class CheckpointManager:
         self.checkpoints_dir.mkdir(exist_ok=True)
         self.model_checkpoints_dir.mkdir(exist_ok=True)
 
+        self.max_model_checkpoints = max_model_checkpoints
+
         self.logger = logging.getLogger("checkpoint_manager")
         self.logger.info(
-            "checkpoint_init | checkpoint_dir=%s checkpoints_dir=%s model_checkpoints_dir=%s",
+            "checkpoint_init | checkpoint_dir=%s checkpoints_dir=%s model_checkpoints_dir=%s max_model_checkpoints=%s",
             self.checkpoint_dir,
             self.checkpoints_dir,
             self.model_checkpoints_dir,
+            self.max_model_checkpoints,
         )
 
     def _log_event(self, event: str, **fields: Any) -> None:
@@ -87,6 +92,30 @@ class CheckpointManager:
             if legacy.exists():
                 return legacy
         return None
+
+    def _assert_sufficient_disk_space_for_copy(
+        self, source_model_path: Path, destination_root: Path
+    ) -> None:
+        """
+        Fail fast when destination free space is lower than source artifact size.
+        """
+        required_bytes = sum(
+            p.stat().st_size for p in source_model_path.rglob("*") if p.is_file()
+        )
+        free_bytes = shutil.disk_usage(destination_root).free
+        self._log_event(
+            "checkpoint_disk_space_check",
+            source_model_path=str(source_model_path),
+            destination_root=str(destination_root),
+            required_bytes=required_bytes,
+            free_bytes=free_bytes,
+        )
+        if free_bytes < required_bytes:
+            raise RuntimeError(
+                "Insufficient disk space for checkpoint copy: "
+                f"required_bytes={required_bytes}, free_bytes={free_bytes}, "
+                f"source_model_path={source_model_path}, destination_root={destination_root}"
+            )
 
     def save_checkpoint(
         self,
@@ -140,6 +169,9 @@ class CheckpointManager:
                 )
             if model_path.exists():
                 shutil.rmtree(model_path)
+            self._assert_sufficient_disk_space_for_copy(
+                source_model_path, self.model_checkpoints_dir
+            )
             self._log_event(
                 "checkpoint_model_save_start",
                 year=year,
@@ -181,6 +213,12 @@ class CheckpointManager:
 
             # Save overall training state
             self._save_training_state(training_state)
+
+            # //fixme-max-checkpoint: per-save prune keeps model_checkpoints/ bounded
+            # during long date ranges. Replace with streaming upload + pointer-only
+            # resume once the checkpoint restore path no longer requires local dirs.
+            if self.max_model_checkpoints is not None:
+                self.prune_model_checkpoints(self.max_model_checkpoints)
 
             self.logger.info(f"Checkpoint saved: {checkpoint_name}")
             return True
@@ -398,6 +436,40 @@ class CheckpointManager:
                 "checkpoint_cleanup_temp",
                 reason="failed",
                 path=str(temp_path),
+                error=str(e),
+            )
+            raise
+
+    def remove_temp_model_directory(self, year: int, month: int) -> None:
+        """Remove checkpoint_dir/temp/temp_model_YYYY_MM. Idempotent."""
+        temp_model_path = (
+            self.checkpoint_dir / "temp" / f"temp_model_{year:04d}_{month:02d}"
+        )
+        if not temp_model_path.exists():
+            self._log_event(
+                "checkpoint_cleanup_temp_model",
+                reason="skipped_missing",
+                path=str(temp_model_path),
+                year=year,
+                month=month,
+            )
+            return
+        try:
+            shutil.rmtree(temp_model_path)
+            self._log_event(
+                "checkpoint_cleanup_temp_model",
+                reason="deleted",
+                path=str(temp_model_path),
+                year=year,
+                month=month,
+            )
+        except OSError as e:
+            self._log_event(
+                "checkpoint_cleanup_temp_model",
+                reason="failed",
+                path=str(temp_model_path),
+                year=year,
+                month=month,
                 error=str(e),
             )
             raise

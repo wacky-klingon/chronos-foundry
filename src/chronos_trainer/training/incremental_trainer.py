@@ -29,6 +29,7 @@ from .model_versioning import ModelVersioning
 from .checkpoint_manager import CheckpointManager
 from ..core.config_helpers import ConfigHelpers
 from ..data.resumable_loader import log_autogluon_timeseries_dataframe_probe
+from ..metrics.recorder import NullMetricsRecorder
 
 
 class IncrementalTrainingError(Exception):
@@ -57,6 +58,7 @@ class IncrementalTrainer(CovariateTrainer):
         self.checkpoint_post_success_cleanup = (
             self._get_required_checkpoint_post_success_cleanup()
         )
+        self.max_model_checkpoints = self._get_required_max_model_checkpoints()
 
         # Use high_quality preset for production training (can be overridden via config)
         self.training_preset = config.get("training_preset", "high_quality")
@@ -179,6 +181,20 @@ class IncrementalTrainer(CovariateTrainer):
                 "incremental_training.checkpoint_post_success_cleanup must be a boolean."
             )
         return raw
+
+    def _get_required_max_model_checkpoints(self) -> int:
+        """Read required per-save checkpoint retention cap from config with no defaults."""
+        raw_value = self.incremental_config.get("max_model_checkpoints")
+        if raw_value is None:
+            raise IncrementalTrainingError(
+                "incremental_training.max_model_checkpoints is required. "
+                "Set it explicitly in config (e.g. max_model_checkpoints: 2)."
+            )
+        if not isinstance(raw_value, int) or raw_value < 1:
+            raise IncrementalTrainingError(
+                "incremental_training.max_model_checkpoints must be an integer >= 1."
+            )
+        return raw_value
 
     def _apply_checkpoint_post_success_cleanup(
         self, checkpoint_manager: CheckpointManager
@@ -759,6 +775,7 @@ class IncrementalTrainer(CovariateTrainer):
         validation_end_date: str,
         checkpoint_dir: str,
         previous_model_path: Optional[str] = None,
+        metrics_recorder: Optional[NullMetricsRecorder] = None,
     ) -> Dict[str, Any]:
         """
         Train incrementally with checkpoint support for large date ranges
@@ -775,6 +792,10 @@ class IncrementalTrainer(CovariateTrainer):
             Training results dictionary
         """
         try:
+            _rec: NullMetricsRecorder = (
+                metrics_recorder if metrics_recorder is not None else NullMetricsRecorder()
+            )
+            _current_phase: Optional[str] = None
             model_path = self._ensure_model_path_available(self.config.get("model_path"))
             self._ensure_path_available(checkpoint_dir, "checkpoint_dir")
             self.logger.info(f"Starting resumable training: {start_date} to {end_date}")
@@ -782,7 +803,10 @@ class IncrementalTrainer(CovariateTrainer):
             file_timing_rows: List[Dict[str, Any]] = []
 
             # Initialize checkpoint manager
-            checkpoint_manager = CheckpointManager(checkpoint_dir)
+            checkpoint_manager = CheckpointManager(
+                checkpoint_dir,
+                max_model_checkpoints=self.max_model_checkpoints,
+            )
 
             # Check if resuming from checkpoint
             last_checkpoint = checkpoint_manager.get_last_checkpoint()
@@ -851,9 +875,14 @@ class IncrementalTrainer(CovariateTrainer):
             resumable_loader = self._get_resumable_loader(checkpoint_manager)
 
             # Get remaining files to process
+            _current_phase = "data_download"
+            _rec.start_phase("data_download")
             all_parquet_files = resumable_loader.get_parquet_files(start_date, end_date)
             remaining_files = resumable_loader.get_remaining_files(start_date, end_date)
             training_state["total_files"] = len(all_parquet_files)
+            _rec.set_file_counts(len(training_state["processed_files"]), len(all_parquet_files))
+            _rec.end_phase("data_download")
+            _current_phase = None
 
             if not remaining_files:
                 if predictor is None:
@@ -881,6 +910,8 @@ class IncrementalTrainer(CovariateTrainer):
                 )
 
             # Process each remaining file
+            _current_phase = "train"
+            _rec.start_phase("train")
             for file_path, year, month in remaining_files:
                 self.logger.info(f"Processing file: {year:04d}-{month:02d}")
                 file_start_time = time.perf_counter()
@@ -946,6 +977,24 @@ class IncrementalTrainer(CovariateTrainer):
                         "message": f"Failed to save checkpoint for {year:04d}-{month:02d}",
                         "checkpoint_dir": checkpoint_dir,
                     }
+                try:
+                    checkpoint_manager.remove_temp_model_directory(year, month)
+                except OSError as e:
+                    self.logger.warning(
+                        "Failed to cleanup temp model dir for %04d-%02d: %s",
+                        year,
+                        month,
+                        e,
+                    )
+
+                try:
+                    _rec.add_bytes_in(Path(file_path).stat().st_size)
+                except Exception:
+                    pass
+                _rec.set_file_counts(
+                    len(training_state["processed_files"]),
+                    training_state["total_files"],
+                )
 
                 file_total_time_s = time.perf_counter() - file_start_time
                 file_timing_rows.append(
@@ -969,7 +1018,12 @@ class IncrementalTrainer(CovariateTrainer):
                 )
                 self.logger.info(f"Checkpoint saved for {year:04d}-{month:02d}")
 
+            _rec.end_phase("train")
+            _current_phase = None
+
             # Final validation on unseen data
+            _current_phase = "validate"
+            _rec.start_phase("validate")
             self.logger.info("Performing final validation on unseen data")
             validation_data = self._load_validation_data(
                 validation_start_date, validation_end_date
@@ -987,6 +1041,9 @@ class IncrementalTrainer(CovariateTrainer):
                 )
                 performance = self._invalid_validation_metrics("validation_data_unavailable")
 
+            _rec.end_phase("validate")
+            _current_phase = None
+
             if not performance.get("validation_valid", False):
                 self.logger.warning(
                     "Training completed with invalid validation state: reason=%s summary=%s",
@@ -995,6 +1052,8 @@ class IncrementalTrainer(CovariateTrainer):
                 )
 
             # Save final model
+            _current_phase = "cleanup"
+            _rec.start_phase("cleanup")
             pf = training_state["processed_files"]
             last = pf[-1] if pf else None
             final_model_path = self._save_final_model(
@@ -1016,6 +1075,8 @@ class IncrementalTrainer(CovariateTrainer):
                 }
 
             self._apply_checkpoint_post_success_cleanup(checkpoint_manager)
+            _rec.end_phase("cleanup")
+            _current_phase = None
 
             epoch_time_s = time.perf_counter() - epoch_start_time
             self.logger.info("Total epoch time: %.3fs", epoch_time_s)
@@ -1043,6 +1104,11 @@ class IncrementalTrainer(CovariateTrainer):
             self.logger.error(
                 "Resumable training failed: %s\n%s", e, traceback.format_exc()
             )
+            try:
+                if _current_phase is not None:
+                    _rec.fail_phase(_current_phase, e)
+            except Exception:
+                pass
             return {
                 "status": "error",
                 "message": f"Resumable training failed: {e}",

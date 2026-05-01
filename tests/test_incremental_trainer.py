@@ -600,3 +600,61 @@ class TestIncrementalTrainer:
         assert "mode=resume_from_disk" in caplog.text
         assert "previous_model is ignored while resuming from checkpoint" in caplog.text
 
+    @patch(
+        "chronos_trainer.training.checkpoint_manager.TimeSeriesPredictor.load",
+        return_value=MagicMock(),
+    )
+    def test_checkpoint_window_mismatch_skips_resume(
+        self, _mock_ts_load, temp_dir, sample_config, caplog
+    ):
+        checkpoint_dir = str(Path(temp_dir) / "checkpoints")
+        checkpoint_manager = CheckpointManager(checkpoint_dir)
+        prior_predictor = MagicMock()
+        prior_predictor.path = _minimal_autogluon_predictor_dir(
+            Path(temp_dir), min_total_bytes=_MIN_FINAL_MODEL_BYTES
+        )
+        checkpoint_manager.save_checkpoint(
+            year=2020,
+            month=1,
+            model=prior_predictor,
+            data_stats={"record_count": 100},
+            training_state={
+                "start_date": "2004-01-01",
+                "end_date": "2019-12-31",
+                "validation_start_date": "2019-11-01",
+                "validation_end_date": "2019-12-31",
+                "processed_files": [
+                    {"file_path": "data.parquet", "year": 2020, "month": 1}
+                ],
+                "total_files": 1,
+                "verification_state": {
+                    "row_count": 1,
+                    "item_ids": ["legacy_item"],
+                    "observed_start_timestamp": "2004-01-01T00:00:00",
+                    "observed_end_timestamp": "2019-12-31T23:00:00",
+                },
+            },
+        )
+
+        trainer = IncrementalTrainer(sample_config)
+        final_predictor = MagicMock()
+        final_predictor.path = _minimal_autogluon_predictor_dir(
+            Path(temp_dir), min_total_bytes=_MIN_FINAL_MODEL_BYTES
+        )
+
+        with patch.object(
+            trainer, "_train_predictor", return_value=(final_predictor, 0.01)
+        ):
+            with caplog.at_level(logging.INFO):
+                result = trainer.train_with_checkpoints(
+                    start_date="2020-01-01",
+                    end_date="2020-02-28",
+                    validation_start_date="2020-03-01",
+                    validation_end_date="2020-03-07",
+                    checkpoint_dir=checkpoint_dir,
+                )
+
+        assert result["status"] == "completed"
+        assert "checkpoint_resume_skipped_due_to_window_mismatch" in caplog.text
+        assert "mode=resume_from_disk" not in caplog.text
+

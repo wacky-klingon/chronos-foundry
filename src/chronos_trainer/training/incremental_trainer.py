@@ -253,6 +253,82 @@ class IncrementalTrainer(CovariateTrainer):
         cfg.setdefault("batch_size", 8)
         return cfg
 
+    def _checkpoint_matches_requested_window(
+        self,
+        checkpoint_state: Optional[Dict[str, Any]],
+        *,
+        start_date: str,
+        end_date: str,
+        validation_start_date: str,
+        validation_end_date: str,
+    ) -> bool:
+        """Return True only when checkpoint state matches the requested date windows."""
+        if not isinstance(checkpoint_state, dict):
+            return False
+        expected = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "validation_start_date": validation_start_date,
+            "validation_end_date": validation_end_date,
+        }
+        for key, expected_value in expected.items():
+            if checkpoint_state.get(key) != expected_value:
+                return False
+        return True
+
+    def _find_raw_timestamp_column(self, df: pd.DataFrame) -> Optional[str]:
+        """Locate the timestamp column before or after preprocessor renames."""
+        preferred = self.config.get("timestamp_col", "timestamp")
+        if preferred in df.columns:
+            return str(preferred)
+        for alias in ("ds", "date", "datetime", "timestamp"):
+            if alias in df.columns:
+                return alias
+        return None
+
+    def _clip_dataframe_to_calendar_window(
+        self,
+        df: pd.DataFrame,
+        window_start: str,
+        window_end: str,
+        *,
+        context: str,
+    ) -> pd.DataFrame:
+        """
+        Keep rows whose timestamp falls on calendar days in [window_start, window_end].
+
+        Monthly parquet shards can still contain out-of-window rows (back-filled history,
+        mis-partitioned data). CLI date bounds must apply to training rows, not only to
+        which month directories are scanned.
+        """
+        if df.empty:
+            return df
+        col = self._find_raw_timestamp_column(df)
+        if col is None:
+            self.logger.warning(
+                "date_window_clip skipped_missing_timestamp_column context=%s cols=%s",
+                context,
+                list(df.columns),
+            )
+            return df
+        ts = pd.to_datetime(df[col], errors="coerce")
+        dates = ts.dt.normalize().dt.date
+        start_d = datetime.strptime(window_start, "%Y-%m-%d").date()
+        end_d = datetime.strptime(window_end, "%Y-%m-%d").date()
+        mask = pd.notna(dates) & (dates >= start_d) & (dates <= end_d)
+        dropped = int((~mask).sum())
+        if dropped:
+            self.logger.info(
+                "date_window_clip context=%s col=%s dropped=%d kept=%d range=%s..%s",
+                context,
+                col,
+                dropped,
+                int(mask.sum()),
+                window_start,
+                window_end,
+            )
+        return df.loc[mask].copy()
+
     def _get_chronos_hyperparameters(self) -> Dict[str, Dict[str, Any]]:
         """Build Chronos-only hyperparameters for TimeSeriesPredictor.fit.
 
@@ -811,7 +887,15 @@ class IncrementalTrainer(CovariateTrainer):
             # Check if resuming from checkpoint
             last_checkpoint = checkpoint_manager.get_last_checkpoint()
 
-            if last_checkpoint:
+            resume_from_checkpoint = False
+            if last_checkpoint and self._checkpoint_matches_requested_window(
+                last_checkpoint.get("training_state"),
+                start_date=start_date,
+                end_date=end_date,
+                validation_start_date=validation_start_date,
+                validation_end_date=validation_end_date,
+            ):
+                resume_from_checkpoint = True
                 self.logger.info(
                     f"Resuming from checkpoint: {last_checkpoint['year']:04d}-{last_checkpoint['month']:02d}"
                 )
@@ -825,6 +909,26 @@ class IncrementalTrainer(CovariateTrainer):
                     "total_files": 0,
                 })
             else:
+                if last_checkpoint and not self._checkpoint_matches_requested_window(
+                    last_checkpoint.get("training_state"),
+                    start_date=start_date,
+                    end_date=end_date,
+                    validation_start_date=validation_start_date,
+                    validation_end_date=validation_end_date,
+                ):
+                    checkpoint_window = last_checkpoint.get("training_state", {})
+                    self.logger.warning(
+                        "checkpoint_resume_skipped_due_to_window_mismatch requested=(%s,%s,%s,%s) "
+                        "checkpoint=(%s,%s,%s,%s)",
+                        start_date,
+                        end_date,
+                        validation_start_date,
+                        validation_end_date,
+                        checkpoint_window.get("start_date"),
+                        checkpoint_window.get("end_date"),
+                        checkpoint_window.get("validation_start_date"),
+                        checkpoint_window.get("validation_end_date"),
+                    )
                 predictor, warm_start_mode, warm_start_detail = (
                     self._resolve_warm_start_predictor(previous_model_path)
                 )
@@ -861,7 +965,7 @@ class IncrementalTrainer(CovariateTrainer):
             else:
                 prev_desc = "not_provided"
 
-            if last_checkpoint:
+            if resume_from_checkpoint:
                 self.logger.info(
                     "incremental_checkpoint_decision mode=resume_from_disk "
                     "checkpoint_month=%04d-%02d previous_model=%s "
@@ -878,7 +982,10 @@ class IncrementalTrainer(CovariateTrainer):
             _current_phase = "data_download"
             _rec.start_phase("data_download")
             all_parquet_files = resumable_loader.get_parquet_files(start_date, end_date)
-            remaining_files = resumable_loader.get_remaining_files(start_date, end_date)
+            if resume_from_checkpoint:
+                remaining_files = resumable_loader.get_remaining_files(start_date, end_date)
+            else:
+                remaining_files = all_parquet_files
             training_state["total_files"] = len(all_parquet_files)
             _rec.set_file_counts(len(training_state["processed_files"]), len(all_parquet_files))
             _rec.end_phase("data_download")
@@ -925,6 +1032,19 @@ class IncrementalTrainer(CovariateTrainer):
                     continue
 
                 df = self.preprocess_raw_dataframe(df)
+                df = self._clip_dataframe_to_calendar_window(
+                    df,
+                    start_date,
+                    end_date,
+                    context=f"train_month {year:04d}-{month:02d}",
+                )
+                if df.empty:
+                    self.logger.warning(
+                        "Skipping %04d-%02d: empty after CLI training date window clip",
+                        year,
+                        month,
+                    )
+                    continue
 
                 # Convert to TimeSeriesDataFrame
                 ts_convert_start_time = time.perf_counter()
@@ -944,6 +1064,8 @@ class IncrementalTrainer(CovariateTrainer):
                     month,
                     training_state["processed_files"],
                     checkpoint_dir=checkpoint_dir,
+                    training_window_start=start_date,
+                    training_window_end=end_date,
                 )
 
                 # Get data stats
@@ -1160,6 +1282,8 @@ class IncrementalTrainer(CovariateTrainer):
         processed_files: List[Dict[str, Any]],
         *,
         checkpoint_dir: str,
+        training_window_start: str,
+        training_window_end: str,
     ) -> Tuple[TimeSeriesPredictor, float]:
         """
         Train a predictor on the given data, optionally using previous predictor or data.
@@ -1171,6 +1295,8 @@ class IncrementalTrainer(CovariateTrainer):
             month: Month of current data
             processed_files: List of previously processed files (for combining data)
             checkpoint_dir: Directory for checkpoints; temp models use checkpoint_dir/temp/
+            training_window_start: Inclusive calendar start for row-level clipping (YYYY-MM-DD)
+            training_window_end: Inclusive calendar end for row-level clipping (YYYY-MM-DD)
 
         Returns:
             Trained TimeSeriesPredictor
@@ -1254,6 +1380,14 @@ class IncrementalTrainer(CovariateTrainer):
             )
             if previous_data is not None:
                 previous_data = self.preprocess_raw_dataframe(previous_data)
+                previous_data = self._clip_dataframe_to_calendar_window(
+                    previous_data,
+                    training_window_start,
+                    training_window_end,
+                    context=f"_train_predictor_lookback y={year:04d} m={month:02d}",
+                )
+                if previous_data.empty:
+                    previous_data = None
                 # Convert previous data to TimeSeriesDataFrame
                 resumable_loader = self._get_resumable_loader(checkpoint_manager=None)
                 previous_convert_start_time = time.perf_counter()
@@ -1333,6 +1467,15 @@ class IncrementalTrainer(CovariateTrainer):
 
             # Combine all validation data
             combined_df = pd.concat(validation_dfs, ignore_index=True)
+
+            combined_df = self._clip_dataframe_to_calendar_window(
+                combined_df,
+                start_date,
+                end_date,
+                context="validation_load",
+            )
+            if combined_df.empty:
+                return None
 
             # Convert to TimeSeriesDataFrame
             return resumable_loader.convert_to_timeseries_dataframe(

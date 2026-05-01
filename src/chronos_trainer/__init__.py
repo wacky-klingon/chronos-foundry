@@ -24,6 +24,13 @@ from chronos_trainer.data import (
 from chronos_trainer.core import (
     ConfigProvider,
 )
+from chronos_trainer.metrics import (
+    LocalMetricsSink,
+    MetricsFinalizer,
+    MetricsRecorder,
+    NullMetricsRecorder,
+    S3MetricsPublisher,
+)
 
 __all__ = [
     "__version__",
@@ -34,5 +41,10 @@ __all__ = [
     "ResumableDataLoader",
     "DataBuffer",
     "ConfigProvider",
+    "LocalMetricsSink",
+    "MetricsFinalizer",
+    "MetricsRecorder",
+    "NullMetricsRecorder",
+    "S3MetricsPublisher",
 ]
 

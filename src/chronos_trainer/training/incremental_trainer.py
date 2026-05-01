@@ -4,6 +4,7 @@ Incremental trainer for continuous model improvement with versioning and rollbac
 
 import json
 import hashlib
+import os
 import pandas as pd
 import numpy as np
 import shutil
@@ -28,6 +29,7 @@ from .model_versioning import ModelVersioning
 from .checkpoint_manager import CheckpointManager
 from ..core.config_helpers import ConfigHelpers
 from ..data.resumable_loader import log_autogluon_timeseries_dataframe_probe
+from ..metrics.recorder import NullMetricsRecorder
 
 
 class IncrementalTrainingError(Exception):
@@ -39,19 +41,7 @@ class IncrementalTrainingError(Exception):
 class IncrementalTrainer(CovariateTrainer):
     """Incremental trainer for continuous model improvement with versioning and rollback"""
 
-    _CHRONOS_VARIANT_TO_MODEL_PATH: Dict[str, str] = {
-        "bolt_tiny": "autogluon/chronos-bolt-tiny",
-        "bolt_mini": "autogluon/chronos-bolt-mini",
-        "bolt_small": "autogluon/chronos-bolt-small",
-        "bolt_base": "autogluon/chronos-bolt-base",
-    }
-    _DEPRECATED_NON_CHRONOS_KEYS: Tuple[str, ...] = (
-        "excluded_model_types",
-        "training_mode",
-        "benchmark_mode",
-    )
-
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any]) -> None:
         # Pass the full config to parent CovariateTrainer so it can access parquet_loader config
         super().__init__(config)
         self.logger = logging.getLogger("incremental_trainer")
@@ -68,11 +58,16 @@ class IncrementalTrainer(CovariateTrainer):
         self.checkpoint_post_success_cleanup = (
             self._get_required_checkpoint_post_success_cleanup()
         )
+        self.max_model_checkpoints = self._get_required_max_model_checkpoints()
 
         # Use high_quality preset for production training (can be overridden via config)
         self.training_preset = config.get("training_preset", "high_quality")
-        self.chronos_variant = self._resolve_chronos_variant()
-        self.chronos_model_path = self._resolve_chronos_model_path(self.chronos_variant)
+        # chronos_variant is retained for logging and training_metadata.json only.
+        self.chronos_variant = (
+            str(self.incremental_config.get("chronos_model_variant", "")).strip().lower()
+            or "unknown"
+        )
+        self.chronos_model_path = self._resolve_chronos_local_model_path()
         self._validate_chronos_only_configuration()
         self.logger.info(
             "Chronos-only incremental training enabled with variant=%s model_path=%s",
@@ -94,6 +89,7 @@ class IncrementalTrainer(CovariateTrainer):
         settings.setdefault("enabled", True)
         settings.setdefault("min_fit_runtime_seconds", 30.0)
         settings.setdefault("allow_constant_validation_target", False)
+        settings.setdefault("allow_covariate_evaluation_skip", False)
         return settings
 
     def _new_verification_state(self) -> Dict[str, Any]:
@@ -186,6 +182,20 @@ class IncrementalTrainer(CovariateTrainer):
             )
         return raw
 
+    def _get_required_max_model_checkpoints(self) -> int:
+        """Read required per-save checkpoint retention cap from config with no defaults."""
+        raw_value = self.incremental_config.get("max_model_checkpoints")
+        if raw_value is None:
+            raise IncrementalTrainingError(
+                "incremental_training.max_model_checkpoints is required. "
+                "Set it explicitly in config (e.g. max_model_checkpoints: 2)."
+            )
+        if not isinstance(raw_value, int) or raw_value < 1:
+            raise IncrementalTrainingError(
+                "incremental_training.max_model_checkpoints must be an integer >= 1."
+            )
+        return raw_value
+
     def _apply_checkpoint_post_success_cleanup(
         self, checkpoint_manager: CheckpointManager
     ) -> None:
@@ -195,61 +205,192 @@ class IncrementalTrainer(CovariateTrainer):
         checkpoint_manager.remove_temp_directory()
         checkpoint_manager.prune_model_checkpoints(self.rollback_window_versions)
 
-    def _resolve_chronos_variant(self) -> str:
-        """Resolve Chronos model variant from incremental config or model_name."""
-        variant = self.incremental_config.get("chronos_model_variant")
-        if isinstance(variant, str) and variant.strip():
-            return variant.strip().lower()
+    def _resolve_chronos_local_model_path(self) -> str:
+        """
+        Resolve and validate the local Chronos base model directory from config.
 
-        chronos_model = self.config.get("chronos_model", {})
-        model_name = chronos_model.get("model_name")
-        if isinstance(model_name, str) and "chronos-bolt-" in model_name:
-            return f"bolt_{model_name.split('chronos-bolt-')[-1].strip().lower()}"
+        Reads ``incremental_training.chronos_local_model_dir``, verifies the path
+        exists on disk, and returns its absolute string form.  No fallback to a
+        HuggingFace Hub ID is permitted under any condition.
 
-        raise IncrementalTrainingError(
-            "incremental_training.chronos_model_variant is required and must be one of "
-            f"{sorted(self._CHRONOS_VARIANT_TO_MODEL_PATH.keys())}"
-        )
-
-    def _resolve_chronos_model_path(self, chronos_variant: str) -> str:
-        """Map Chronos variant to AutoGluon Chronos model path."""
-        model_path = self._CHRONOS_VARIANT_TO_MODEL_PATH.get(chronos_variant)
-        if model_path is None:
+        Raises:
+            IncrementalTrainingError: if the config key is absent, the value is
+                empty, or the resolved path does not exist as a directory on disk.
+        """
+        local_dir = self.incremental_config.get("chronos_local_model_dir")
+        if not local_dir or not str(local_dir).strip():
             raise IncrementalTrainingError(
-                f"Unsupported incremental_training.chronos_model_variant={chronos_variant!r}. "
-                f"Supported values: {sorted(self._CHRONOS_VARIANT_TO_MODEL_PATH.keys())}"
+                "incremental_training.chronos_local_model_dir is required. "
+                "Set it to the local filesystem path of the downloaded Chronos base model. "
+                "Run scripts/bootstrap_base_model.py to populate the directory."
             )
-        return model_path
+        path = Path(str(local_dir)).resolve()
+        if not path.exists():
+            raise IncrementalTrainingError(
+                f"incremental_training.chronos_local_model_dir does not exist on disk: {path}"
+            )
+        if not path.is_dir():
+            raise IncrementalTrainingError(
+                f"incremental_training.chronos_local_model_dir is not a directory: {path}"
+            )
+        return str(path)
 
     def _validate_chronos_only_configuration(self) -> None:
-        """Fail fast when non-Chronos/mixed-model keys are present."""
+        """Raise if incremental_training.chronos_only is not true."""
         if not self.chronos_only:
             raise IncrementalTrainingError(
                 "incremental_training.chronos_only must be true. "
                 "Mixed-model incremental training is not supported."
             )
 
-        deprecated_keys = [
-            key for key in self._DEPRECATED_NON_CHRONOS_KEYS if key in self.incremental_config
-        ]
-        if deprecated_keys:
-            raise IncrementalTrainingError(
-                "Deprecated non-Chronos config keys detected in incremental_training: "
-                f"{deprecated_keys}. Remove them for Chronos-only training."
+    def _get_fine_tune_config(self) -> Dict[str, Any]:
+        """Return the fine_tune sub-block from incremental_training config with defaults."""
+        raw = self.incremental_config.get("fine_tune", {})
+        cfg = dict(raw) if isinstance(raw, dict) else {}
+        cfg.setdefault("enabled", True)
+        cfg.setdefault("learning_rate", 1e-5)
+        cfg.setdefault("steps", 200)
+        cfg.setdefault("batch_size", 8)
+        return cfg
+
+    def _checkpoint_matches_requested_window(
+        self,
+        checkpoint_state: Optional[Dict[str, Any]],
+        *,
+        start_date: str,
+        end_date: str,
+        validation_start_date: str,
+        validation_end_date: str,
+    ) -> bool:
+        """Return True only when checkpoint state matches the requested date windows."""
+        if not isinstance(checkpoint_state, dict):
+            return False
+        expected = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "validation_start_date": validation_start_date,
+            "validation_end_date": validation_end_date,
+        }
+        for key, expected_value in expected.items():
+            if checkpoint_state.get(key) != expected_value:
+                return False
+        return True
+
+    def _find_raw_timestamp_column(self, df: pd.DataFrame) -> Optional[str]:
+        """Locate the timestamp column before or after preprocessor renames."""
+        preferred = self.config.get("timestamp_col", "timestamp")
+        if preferred in df.columns:
+            return str(preferred)
+        for alias in ("ds", "date", "datetime", "timestamp"):
+            if alias in df.columns:
+                return alias
+        return None
+
+    def _clip_dataframe_to_calendar_window(
+        self,
+        df: pd.DataFrame,
+        window_start: str,
+        window_end: str,
+        *,
+        context: str,
+    ) -> pd.DataFrame:
+        """
+        Keep rows whose timestamp falls on calendar days in [window_start, window_end].
+
+        Monthly parquet shards can still contain out-of-window rows (back-filled history,
+        mis-partitioned data). CLI date bounds must apply to training rows, not only to
+        which month directories are scanned.
+        """
+        if df.empty:
+            return df
+        col = self._find_raw_timestamp_column(df)
+        if col is None:
+            self.logger.warning(
+                "date_window_clip skipped_missing_timestamp_column context=%s cols=%s",
+                context,
+                list(df.columns),
             )
+            return df
+        ts = pd.to_datetime(df[col], errors="coerce")
+        dates = ts.dt.normalize().dt.date
+        start_d = datetime.strptime(window_start, "%Y-%m-%d").date()
+        end_d = datetime.strptime(window_end, "%Y-%m-%d").date()
+        mask = pd.notna(dates) & (dates >= start_d) & (dates <= end_d)
+        dropped = int((~mask).sum())
+        if dropped:
+            self.logger.info(
+                "date_window_clip context=%s col=%s dropped=%d kept=%d range=%s..%s",
+                context,
+                col,
+                dropped,
+                int(mask.sum()),
+                window_start,
+                window_end,
+            )
+        return df.loc[mask].copy()
 
     def _get_chronos_hyperparameters(self) -> Dict[str, Dict[str, Any]]:
-        """Build Chronos-only hyperparameters for TimeSeriesPredictor.fit."""
-        return {
-            "Chronos": {
-                "model_path": self.chronos_model_path,
-                "context_length": self.context_length,
-                "learning_rate": self.learning_rate,
-                "batch_size": self.batch_size,
-                "max_epochs": self.max_epochs,
-                "device": self.device,
-            }
+        """Build Chronos-only hyperparameters for TimeSeriesPredictor.fit.
+
+        The fine_tune keys are required for AutoGluon's Chronos backend to perform
+        real fine-tuning and write a fine-tuned-ckpt directory.  Without them,
+        AutoGluon runs in zero-shot mode and produces only pickle artifacts, which
+        causes safetensors export to fail with no checkpoint found.
+        """
+        ft = self._get_fine_tune_config()
+        params: Dict[str, Any] = {
+            "model_path": self.chronos_model_path,
+            "context_length": self.context_length,
+            "learning_rate": self.learning_rate,
+            "batch_size": self.batch_size,
+            "max_epochs": self.max_epochs,
+            "device": self.device,
+            "fine_tune": ft["enabled"],
+            "fine_tune_lr": ft["learning_rate"],
+            "fine_tune_steps": ft["steps"],
+            "fine_tune_batch_size": ft["batch_size"],
         }
+        return {"Chronos": params}
+
+    def _assert_fine_tuned_checkpoint_exists(self, predictor_path: Path) -> None:
+        """Raise IncrementalTrainingError if fine-tuning was requested but AutoGluon
+        did not produce a fine-tuned-ckpt directory under predictor_path/models/.
+
+        A missing checkpoint means AutoGluon ran in zero-shot mode despite receiving
+        fine_tune: true, which will cause safetensors export to fail downstream.
+        Failing here with diagnostics is cheaper than running the rest of the pipeline
+        against an incomplete artifact.
+        """
+        ft = self._get_fine_tune_config()
+        if not ft.get("enabled", True):
+            return
+
+        models_dir = predictor_path / "models"
+        if not models_dir.exists():
+            discovered: List[str] = []
+        else:
+            discovered = sorted(
+                str(p.relative_to(predictor_path))
+                for p in models_dir.rglob("*")
+                if p.is_dir()
+            )
+
+        ckpt_dirs = [d for d in discovered if "fine-tuned-ckpt" in d]
+        if ckpt_dirs:
+            self.logger.info(
+                "fine-tuned-ckpt confirmed at: %s",
+                ckpt_dirs,
+            )
+            return
+
+        raise IncrementalTrainingError(
+            "fine_tune is enabled but no fine-tuned-ckpt directory was found under "
+            f"{predictor_path / 'models'}. AutoGluon may have silently fallen back to "
+            "zero-shot mode. Discovered model subdirectories: "
+            + (", ".join(discovered) if discovered else "(none)")
+            + ". Check that fine_tune_lr, fine_tune_steps, and fine_tune_batch_size "
+            "are accepted by the installed AutoGluon version."
+        )
 
     def _log_artifact_event(self, event: str, **fields: Any) -> None:
         """Structured artifact lifecycle logging for pointer/debug diagnostics."""
@@ -278,28 +419,6 @@ class IncrementalTrainer(CovariateTrainer):
         if too_small:
             missing.append("artifact_too_small(<1MB)")
         return len(missing) == 0, missing, manifest
-
-    def _get_excluded_model_types(self) -> List[str]:
-        """
-        Load excluded_model_types from incremental_training config only.
-        No defaults in code: key must be present (empty list means exclude none).
-        """
-        raw = self.incremental_config.get("excluded_model_types")
-        if raw is None:
-            raise IncrementalTrainingError(
-                "incremental_training.excluded_model_types is required in configuration "
-                "(list of AutoGluon model type names; use [] to exclude none)."
-            )
-        if not isinstance(raw, list):
-            raise IncrementalTrainingError(
-                "incremental_training.excluded_model_types must be a list of strings."
-            )
-        for item in raw:
-            if not isinstance(item, str):
-                raise IncrementalTrainingError(
-                    "incremental_training.excluded_model_types must contain only strings."
-                )
-        return list(raw)
 
     def _ensure_path_available(
         self,
@@ -334,11 +453,25 @@ class IncrementalTrainer(CovariateTrainer):
         """Ensure model_path is configured and available. Raises if not."""
         return self._ensure_path_available(model_path, "model_path")
 
+    @staticmethod
+    def _candidate_has_safetensors(path: Path) -> bool:
+        """Return True if path contains a valid top-level safetensors/ export."""
+        return (
+            (path / "safetensors" / "config.json").exists()
+            and (path / "safetensors" / "model.safetensors").exists()
+        )
+
     def _resolve_warm_start_predictor(
         self, previous_model_path: Optional[str]
     ) -> Tuple[Optional[TimeSeriesPredictor], str, str]:
         """
         Resolve best-effort warm start predictor for checkpoint training.
+
+        Warm-start eligibility now requires a safetensors-verified artifact.
+        If the candidate exists but is missing top-level safetensors artifacts,
+        the predictor is still loaded (migration compatibility) but the mode is
+        logged as ``warm_start_fallback_legacy_predictor`` rather than
+        ``warm_start_from_safetensors_verified``.
 
         Returns:
             (predictor, mode_token, detail)
@@ -359,18 +492,35 @@ class IncrementalTrainer(CovariateTrainer):
             )
             return None, "fresh_start_fallback_from_previous_model", detail
 
+        has_safetensors = self._candidate_has_safetensors(path)
+        if has_safetensors:
+            warm_start_mode = "warm_start_from_safetensors_verified"
+        else:
+            warm_start_mode = "warm_start_fallback_legacy_predictor"
+            self.logger.warning(
+                "incremental_checkpoint_decision mode=warm_start_fallback_legacy_predictor "
+                "previous_model=path=%r safetensors_missing=True "
+                "(proceeding with legacy predictor load; re-run with updated wrapper to satisfy contract)",
+                previous_model_path,
+            )
+
         try:
             predictor = self._load_previous_model(str(path))
-            detail = f"previous_model=path={previous_model_path!r} exists=True"
+            detail = (
+                f"previous_model=path={previous_model_path!r} exists=True "
+                f"safetensors_verified={has_safetensors}"
+            )
             self.logger.info(
-                "incremental_checkpoint_decision mode=warm_start_from_previous_model %s",
+                "incremental_checkpoint_decision mode=%s %s",
+                warm_start_mode,
                 detail,
             )
-            return predictor, "warm_start_from_previous_model", detail
+            return predictor, warm_start_mode, detail
         except Exception as exc:
             reason = str(exc).replace("\n", " ").replace("\r", " ")
             detail = (
                 f"previous_model=path={previous_model_path!r} exists=True "
+                f"safetensors_verified={has_safetensors} "
                 f"fallback_reason={reason}"
             )
             self.logger.warning(
@@ -378,185 +528,6 @@ class IncrementalTrainer(CovariateTrainer):
                 detail,
             )
             return None, "fresh_start_fallback_from_previous_model", detail
-
-    def train_incremental(
-        self,
-        data: pd.DataFrame,
-        date_range: Tuple[str, str],
-        previous_model_path: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        Train model incrementally on new data range
-
-        Args:
-            data: New training data for the specified date range
-            date_range: Tuple of (start_date, end_date) for this training phase
-            previous_model_path: Path to previous model to use as starting point
-
-        Returns:
-            Dictionary with training results, version info, and performance metrics
-        """
-        try:
-            self._ensure_model_path_available(self.config.get("model_path"))
-            self.logger.info(
-                f"Starting incremental training for date range: {date_range[0]} to {date_range[1]}"
-            )
-
-            # Generate new model version
-            version_id = self.versioning.generate_version_id(date_range)
-            self.logger.info(f"Creating new model version: {version_id}")
-
-            # Load previous model if provided
-            previous_predictor = None
-            if previous_model_path and Path(previous_model_path).exists():
-                try:
-                    previous_predictor = self._load_previous_model(previous_model_path)
-                    self.logger.info(
-                        f"Loaded previous model from: {previous_model_path}"
-                    )
-                except Exception as e:
-                    self.logger.warning(
-                        f"Failed to load previous model: {e}. Starting fresh."
-                    )
-
-            # Prepare data for training
-            ts_data = self.prepare_timeseries_dataframe(data)
-
-            # Create new predictor
-            predictor = TimeSeriesPredictor(
-                prediction_length=self.prediction_length,
-                target="target",
-                eval_metric="MASE",
-            )
-
-            # Train with or without previous model
-            if previous_predictor:
-                # Incremental training with previous model as starting point
-                self.logger.info(
-                    "Performing incremental training with previous model as starting point"
-                )
-                predictor.fit(
-                    ts_data,
-                    presets=self.training_preset,  # CPU-compatible preset for large datasets
-                    hyperparameters={
-                        # CPU-compatible models for 20+ years of data
-                        "ARIMA": {
-                            "order": (2, 1, 2),  # More complex ARIMA
-                            "seasonal_order": (1, 1, 1, 12),  # Seasonal patterns
-                        },
-                        "ETS": {
-                            "trend": "add",
-                            "seasonal": "add",
-                            "seasonal_periods": 12,
-                        },
-                        "Theta": {
-                            "seasonality_mode": "multiplicative",
-                        },
-                        "AutoETS": {
-                            "seasonal": "auto",
-                        },
-                    },
-                    excluded_model_types=self._get_excluded_model_types(),
-                )
-            else:
-                # Fresh training
-                self.logger.info("Performing fresh training (no previous model)")
-                predictor.fit(
-                    ts_data,
-                    presets=self.training_preset,  # CPU-compatible preset for large datasets
-                    hyperparameters={
-                        # CPU-compatible models for 20+ years of data
-                        "ARIMA": {
-                            "order": (2, 1, 2),  # More complex ARIMA
-                            "seasonal_order": (1, 1, 1, 12),  # Seasonal patterns
-                        },
-                        "ETS": {
-                            "trend": "add",
-                            "seasonal": "add",
-                            "seasonal_periods": 12,
-                        },
-                        "Theta": {
-                            "seasonality_mode": "multiplicative",
-                        },
-                        "AutoETS": {
-                            "seasonal": "auto",
-                        },
-                    },
-                    excluded_model_types=self._get_excluded_model_types(),
-                )
-
-            # Evaluate performance
-            performance_metrics = self._evaluate_model_performance(predictor, ts_data)
-
-            # Check if performance meets threshold
-            performance_improvement = None
-            if previous_predictor:
-                previous_performance = self.versioning.get_previous_performance(
-                    previous_model_path
-                )
-                performance_improvement = (
-                    self.versioning.calculate_performance_improvement(
-                        performance_metrics, previous_performance
-                    )
-                )
-
-                if performance_improvement < self.performance_threshold:
-                    self.logger.warning(
-                        f"Performance improvement ({performance_improvement:.2%}) below threshold ({self.performance_threshold:.2%})"
-                    )
-                    if self.rollback_enabled:
-                        self.logger.info("Rolling back to previous model version")
-                        return self.versioning.rollback_to_previous(version_id)
-                    else:
-                        self.logger.warning(
-                            "Rollback disabled, keeping new model despite poor performance"
-                        )
-
-            # Save new model version
-            model_config = {
-                "prediction_length": self.prediction_length,
-                "context_length": self.context_length,
-                "learning_rate": self.learning_rate,
-                "batch_size": self.batch_size,
-                "max_epochs": self.max_epochs,
-            }
-
-            model_path = self.versioning.save_model_version(
-                predictor,
-                version_id,
-                date_range,
-                performance_metrics,
-                model_config,
-                self.covariate_config,
-            )
-
-            # Update version tracking
-            self.versioning.update_version_tracking(
-                version_id, model_path, date_range, performance_metrics
-            )
-
-            # Clean up old versions if needed
-            self.versioning.cleanup_old_versions()
-
-            self.logger.info(
-                f"Incremental training completed successfully. Model saved to: {model_path}"
-            )
-
-            return {
-                "success": True,
-                "version_id": version_id,
-                "model_path": model_path,
-                "date_range": date_range,
-                "performance_metrics": performance_metrics,
-                "performance_improvement": performance_improvement,
-                "previous_version": self.versioning.previous_version,
-            }
-
-        except Exception as e:
-            self.logger.error(
-                "Incremental training failed: %s\n%s", e, traceback.format_exc()
-            )
-            raise IncrementalTrainingError(f"Incremental training failed: {e}") from e
 
     def _load_previous_model(self, model_path: str) -> TimeSeriesPredictor:
         """Load previous model for incremental training"""
@@ -708,9 +679,31 @@ class IncrementalTrainer(CovariateTrainer):
             # Generate predictions for evaluation
             self.logger.info("Generating predictions...")
             known_covariates_names = self.incremental_config.get("known_covariates", [])
-            if known_covariates_names and all(
-                c in val_data.columns for c in known_covariates_names
-            ):
+            missing_covariates = [
+                c for c in known_covariates_names if c not in val_data.columns
+            ]
+            if known_covariates_names and missing_covariates:
+                # The predictor was trained with known_covariates but the validation
+                # parquet data is raw (engineered features not recomputed at eval time).
+                # Calling predict without covariates would raise ValueError from AutoGluon.
+                # Return a named reason so the caller can allow this via config rather
+                # than silently catching a generic evaluation_exception.
+                self.logger.warning(
+                    "Evaluation skipped: predictor requires %d known covariate(s) "
+                    "that are absent from the validation data. "
+                    "Missing: %s",
+                    len(missing_covariates),
+                    missing_covariates,
+                )
+                return self._invalid_validation_metrics(
+                    "evaluation_skipped_covariates_not_in_validation_data",
+                    summary={
+                        "required_covariates": len(known_covariates_names),
+                        "missing_covariates": missing_covariates,
+                        "validation_rows": int(len(val_data)),
+                    },
+                )
+            if known_covariates_names:
                 known_cov_df = val_data[known_covariates_names]
                 predictions = predictor.predict(
                     train_data, known_covariates=known_cov_df
@@ -858,6 +851,7 @@ class IncrementalTrainer(CovariateTrainer):
         validation_end_date: str,
         checkpoint_dir: str,
         previous_model_path: Optional[str] = None,
+        metrics_recorder: Optional[NullMetricsRecorder] = None,
     ) -> Dict[str, Any]:
         """
         Train incrementally with checkpoint support for large date ranges
@@ -874,6 +868,10 @@ class IncrementalTrainer(CovariateTrainer):
             Training results dictionary
         """
         try:
+            _rec: NullMetricsRecorder = (
+                metrics_recorder if metrics_recorder is not None else NullMetricsRecorder()
+            )
+            _current_phase: Optional[str] = None
             model_path = self._ensure_model_path_available(self.config.get("model_path"))
             self._ensure_path_available(checkpoint_dir, "checkpoint_dir")
             self.logger.info(f"Starting resumable training: {start_date} to {end_date}")
@@ -881,12 +879,23 @@ class IncrementalTrainer(CovariateTrainer):
             file_timing_rows: List[Dict[str, Any]] = []
 
             # Initialize checkpoint manager
-            checkpoint_manager = CheckpointManager(checkpoint_dir)
+            checkpoint_manager = CheckpointManager(
+                checkpoint_dir,
+                max_model_checkpoints=self.max_model_checkpoints,
+            )
 
             # Check if resuming from checkpoint
             last_checkpoint = checkpoint_manager.get_last_checkpoint()
 
-            if last_checkpoint:
+            resume_from_checkpoint = False
+            if last_checkpoint and self._checkpoint_matches_requested_window(
+                last_checkpoint.get("training_state"),
+                start_date=start_date,
+                end_date=end_date,
+                validation_start_date=validation_start_date,
+                validation_end_date=validation_end_date,
+            ):
+                resume_from_checkpoint = True
                 self.logger.info(
                     f"Resuming from checkpoint: {last_checkpoint['year']:04d}-{last_checkpoint['month']:02d}"
                 )
@@ -900,6 +909,26 @@ class IncrementalTrainer(CovariateTrainer):
                     "total_files": 0,
                 })
             else:
+                if last_checkpoint and not self._checkpoint_matches_requested_window(
+                    last_checkpoint.get("training_state"),
+                    start_date=start_date,
+                    end_date=end_date,
+                    validation_start_date=validation_start_date,
+                    validation_end_date=validation_end_date,
+                ):
+                    checkpoint_window = last_checkpoint.get("training_state", {})
+                    self.logger.warning(
+                        "checkpoint_resume_skipped_due_to_window_mismatch requested=(%s,%s,%s,%s) "
+                        "checkpoint=(%s,%s,%s,%s)",
+                        start_date,
+                        end_date,
+                        validation_start_date,
+                        validation_end_date,
+                        checkpoint_window.get("start_date"),
+                        checkpoint_window.get("end_date"),
+                        checkpoint_window.get("validation_start_date"),
+                        checkpoint_window.get("validation_end_date"),
+                    )
                 predictor, warm_start_mode, warm_start_detail = (
                     self._resolve_warm_start_predictor(previous_model_path)
                 )
@@ -936,7 +965,7 @@ class IncrementalTrainer(CovariateTrainer):
             else:
                 prev_desc = "not_provided"
 
-            if last_checkpoint:
+            if resume_from_checkpoint:
                 self.logger.info(
                     "incremental_checkpoint_decision mode=resume_from_disk "
                     "checkpoint_month=%04d-%02d previous_model=%s "
@@ -950,9 +979,17 @@ class IncrementalTrainer(CovariateTrainer):
             resumable_loader = self._get_resumable_loader(checkpoint_manager)
 
             # Get remaining files to process
+            _current_phase = "data_download"
+            _rec.start_phase("data_download")
             all_parquet_files = resumable_loader.get_parquet_files(start_date, end_date)
-            remaining_files = resumable_loader.get_remaining_files(start_date, end_date)
+            if resume_from_checkpoint:
+                remaining_files = resumable_loader.get_remaining_files(start_date, end_date)
+            else:
+                remaining_files = all_parquet_files
             training_state["total_files"] = len(all_parquet_files)
+            _rec.set_file_counts(len(training_state["processed_files"]), len(all_parquet_files))
+            _rec.end_phase("data_download")
+            _current_phase = None
 
             if not remaining_files:
                 if predictor is None:
@@ -980,6 +1017,8 @@ class IncrementalTrainer(CovariateTrainer):
                 )
 
             # Process each remaining file
+            _current_phase = "train"
+            _rec.start_phase("train")
             for file_path, year, month in remaining_files:
                 self.logger.info(f"Processing file: {year:04d}-{month:02d}")
                 file_start_time = time.perf_counter()
@@ -990,6 +1029,21 @@ class IncrementalTrainer(CovariateTrainer):
                 parquet_load_time_s = time.perf_counter() - parquet_load_start_time
                 if df is None:
                     self.logger.error(f"Failed to load file: {file_path}")
+                    continue
+
+                df = self.preprocess_raw_dataframe(df)
+                df = self._clip_dataframe_to_calendar_window(
+                    df,
+                    start_date,
+                    end_date,
+                    context=f"train_month {year:04d}-{month:02d}",
+                )
+                if df.empty:
+                    self.logger.warning(
+                        "Skipping %04d-%02d: empty after CLI training date window clip",
+                        year,
+                        month,
+                    )
                     continue
 
                 # Convert to TimeSeriesDataFrame
@@ -1010,6 +1064,8 @@ class IncrementalTrainer(CovariateTrainer):
                     month,
                     training_state["processed_files"],
                     checkpoint_dir=checkpoint_dir,
+                    training_window_start=start_date,
+                    training_window_end=end_date,
                 )
 
                 # Get data stats
@@ -1043,6 +1099,24 @@ class IncrementalTrainer(CovariateTrainer):
                         "message": f"Failed to save checkpoint for {year:04d}-{month:02d}",
                         "checkpoint_dir": checkpoint_dir,
                     }
+                try:
+                    checkpoint_manager.remove_temp_model_directory(year, month)
+                except OSError as e:
+                    self.logger.warning(
+                        "Failed to cleanup temp model dir for %04d-%02d: %s",
+                        year,
+                        month,
+                        e,
+                    )
+
+                try:
+                    _rec.add_bytes_in(Path(file_path).stat().st_size)
+                except Exception:
+                    pass
+                _rec.set_file_counts(
+                    len(training_state["processed_files"]),
+                    training_state["total_files"],
+                )
 
                 file_total_time_s = time.perf_counter() - file_start_time
                 file_timing_rows.append(
@@ -1066,7 +1140,12 @@ class IncrementalTrainer(CovariateTrainer):
                 )
                 self.logger.info(f"Checkpoint saved for {year:04d}-{month:02d}")
 
+            _rec.end_phase("train")
+            _current_phase = None
+
             # Final validation on unseen data
+            _current_phase = "validate"
+            _rec.start_phase("validate")
             self.logger.info("Performing final validation on unseen data")
             validation_data = self._load_validation_data(
                 validation_start_date, validation_end_date
@@ -1084,6 +1163,9 @@ class IncrementalTrainer(CovariateTrainer):
                 )
                 performance = self._invalid_validation_metrics("validation_data_unavailable")
 
+            _rec.end_phase("validate")
+            _current_phase = None
+
             if not performance.get("validation_valid", False):
                 self.logger.warning(
                     "Training completed with invalid validation state: reason=%s summary=%s",
@@ -1092,6 +1174,8 @@ class IncrementalTrainer(CovariateTrainer):
                 )
 
             # Save final model
+            _current_phase = "cleanup"
+            _rec.start_phase("cleanup")
             pf = training_state["processed_files"]
             last = pf[-1] if pf else None
             final_model_path = self._save_final_model(
@@ -1113,6 +1197,8 @@ class IncrementalTrainer(CovariateTrainer):
                 }
 
             self._apply_checkpoint_post_success_cleanup(checkpoint_manager)
+            _rec.end_phase("cleanup")
+            _current_phase = None
 
             epoch_time_s = time.perf_counter() - epoch_start_time
             self.logger.info("Total epoch time: %.3fs", epoch_time_s)
@@ -1121,7 +1207,7 @@ class IncrementalTrainer(CovariateTrainer):
                 "status": "completed",
                 "message": "Resumable training completed successfully",
                 "checkpoint_dir": checkpoint_dir,
-                "final_model_path": final_model_path,
+                "model_path": final_model_path,
                 "performance": performance,
                 "processed_files": len(training_state["processed_files"]),
                 "total_files": training_state["total_files"],
@@ -1140,6 +1226,11 @@ class IncrementalTrainer(CovariateTrainer):
             self.logger.error(
                 "Resumable training failed: %s\n%s", e, traceback.format_exc()
             )
+            try:
+                if _current_phase is not None:
+                    _rec.fail_phase(_current_phase, e)
+            except Exception:
+                pass
             return {
                 "status": "error",
                 "message": f"Resumable training failed: {e}",
@@ -1191,6 +1282,8 @@ class IncrementalTrainer(CovariateTrainer):
         processed_files: List[Dict[str, Any]],
         *,
         checkpoint_dir: str,
+        training_window_start: str,
+        training_window_end: str,
     ) -> Tuple[TimeSeriesPredictor, float]:
         """
         Train a predictor on the given data, optionally using previous predictor or data.
@@ -1202,6 +1295,8 @@ class IncrementalTrainer(CovariateTrainer):
             month: Month of current data
             processed_files: List of previously processed files (for combining data)
             checkpoint_dir: Directory for checkpoints; temp models use checkpoint_dir/temp/
+            training_window_start: Inclusive calendar start for row-level clipping (YYYY-MM-DD)
+            training_window_end: Inclusive calendar end for row-level clipping (YYYY-MM-DD)
 
         Returns:
             Trained TimeSeriesPredictor
@@ -1219,6 +1314,11 @@ class IncrementalTrainer(CovariateTrainer):
         known_covariates = self.incremental_config.get("known_covariates", [])
         lookback_days = self.incremental_config.get("lookback_days")
         chronos_hyperparameters = self._get_chronos_hyperparameters()
+
+        for env_var in ("TRANSFORMERS_OFFLINE", "HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE"):
+            os.environ[env_var] = "1"
+            self.logger.info("offline_mode env_var=%s value=1", env_var)
+
         self.logger.info(
             "Models that will be trained: ['Chronos[%s]']",
             self.chronos_variant,
@@ -1279,6 +1379,15 @@ class IncrementalTrainer(CovariateTrainer):
                 previous_load_time_s,
             )
             if previous_data is not None:
+                previous_data = self.preprocess_raw_dataframe(previous_data)
+                previous_data = self._clip_dataframe_to_calendar_window(
+                    previous_data,
+                    training_window_start,
+                    training_window_end,
+                    context=f"_train_predictor_lookback y={year:04d} m={month:02d}",
+                )
+                if previous_data.empty:
+                    previous_data = None
                 # Convert previous data to TimeSeriesDataFrame
                 resumable_loader = self._get_resumable_loader(checkpoint_manager=None)
                 previous_convert_start_time = time.perf_counter()
@@ -1326,6 +1435,7 @@ class IncrementalTrainer(CovariateTrainer):
             fit_time_s = time.perf_counter() - fit_start_time
 
         self.logger.info("predictor.fit() time for %04d-%02d: %.3fs", year, month, fit_time_s)
+        self._assert_fine_tuned_checkpoint_exists(Path(temp_model_path))
         return predictor, fit_time_s
 
     def _load_validation_data(
@@ -1357,6 +1467,15 @@ class IncrementalTrainer(CovariateTrainer):
 
             # Combine all validation data
             combined_df = pd.concat(validation_dfs, ignore_index=True)
+
+            combined_df = self._clip_dataframe_to_calendar_window(
+                combined_df,
+                start_date,
+                end_date,
+                context="validation_load",
+            )
+            if combined_df.empty:
+                return None
 
             # Convert to TimeSeriesDataFrame
             return resumable_loader.convert_to_timeseries_dataframe(

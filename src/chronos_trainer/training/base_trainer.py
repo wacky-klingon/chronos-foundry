@@ -2,6 +2,8 @@
 Base model training components for the Chronos-Bolt system
 """
 
+from __future__ import annotations
+
 import os
 import pandas as pd
 import numpy as np
@@ -12,7 +14,6 @@ import logging
 # Import AutoGluon components
 try:
     from autogluon.timeseries import TimeSeriesDataFrame, TimeSeriesPredictor
-    from autogluon.timeseries.models import ChronosModel
 except ImportError as e:
     logger = logging.getLogger(__name__)
     logger.error(f"AutoGluon import error: {e}")

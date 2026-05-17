@@ -2,6 +2,8 @@
 Incremental trainer for continuous model improvement with versioning and rollback
 """
 
+from __future__ import annotations
+
 import json
 import hashlib
 import os
@@ -678,7 +680,13 @@ class IncrementalTrainer(CovariateTrainer):
 
             # Generate predictions for evaluation
             self.logger.info("Generating predictions...")
-            known_covariates_names = self.incremental_config.get("known_covariates", [])
+            trained_raw = getattr(predictor, "known_covariates_names", None)
+            if isinstance(trained_raw, (list, tuple)):
+                known_covariates_names = list(trained_raw)
+            else:
+                known_covariates_names = list(
+                    self.incremental_config.get("known_covariates") or []
+                )
             missing_covariates = [
                 c for c in known_covariates_names if c not in val_data.columns
             ]
@@ -698,7 +706,7 @@ class IncrementalTrainer(CovariateTrainer):
                 return self._invalid_validation_metrics(
                     "evaluation_skipped_covariates_not_in_validation_data",
                     summary={
-                        "required_covariates": len(known_covariates_names),
+                        "required_covariates": int(len(known_covariates_names)),
                         "missing_covariates": missing_covariates,
                         "validation_rows": int(len(val_data)),
                     },
@@ -1273,6 +1281,34 @@ class IncrementalTrainer(CovariateTrainer):
             )
             return {"status": "error", "message": f"Failed to resume training: {e}"}
 
+    def _effective_known_covariates_names(
+        self,
+        *,
+        fit_data: TimeSeriesDataFrame,
+        log_context: str,
+    ) -> List[str]:
+        """
+        Intersect configured known_covariates with columns present on the fit frame.
+
+        Names absent from fit_data are omitted (upstream archive gaps, renames).
+        Logs missing names at INFO so operators can reconcile YAML vs parquet.
+        """
+        configured = list(self.incremental_config.get("known_covariates") or [])
+        if not configured:
+            return []
+        available = set(fit_data.columns)
+        effective = [c for c in configured if c in available]
+        missing = [c for c in configured if c not in available]
+        if missing:
+            self.logger.info(
+                "known_covariates context=%s: %d configured name(s) absent from "
+                "train_data columns; omitting from fit: %s",
+                log_context,
+                len(missing),
+                missing,
+            )
+        return effective
+
     def _train_predictor(
         self,
         previous_predictor: Optional[TimeSeriesPredictor],
@@ -1311,7 +1347,6 @@ class IncrementalTrainer(CovariateTrainer):
             phase=f"_train_predictor_pre_fit y={year:04d} m={month:02d} branch=initial",
         )
 
-        known_covariates = self.incremental_config.get("known_covariates", [])
         lookback_days = self.incremental_config.get("lookback_days")
         chronos_hyperparameters = self._get_chronos_hyperparameters()
 
@@ -1325,12 +1360,16 @@ class IncrementalTrainer(CovariateTrainer):
         )
 
         if previous_predictor is None:
-            # First file - create new predictor
-            # ResumableDataLoader maps config target_col (e.g. target_close) to column "target".
+            # First file - create new predictor.
+            # ResumableDataLoader maps the configured target column to column "target".
+            effective_covariates = self._effective_known_covariates_names(
+                fit_data=ts_df,
+                log_context=f"y={year:04d} m={month:02d} branch=initial",
+            )
             predictor = TimeSeriesPredictor(
                 target="target",
                 prediction_length=self.prediction_length,
-                known_covariates_names=known_covariates,
+                known_covariates_names=effective_covariates,
                 path=temp_model_path,
             )
             fit_start_time = time.perf_counter()
@@ -1417,11 +1456,15 @@ class IncrementalTrainer(CovariateTrainer):
                 phase=f"_train_predictor_pre_fit y={year:04d} m={month:02d} branch=combined_window",
             )
 
-            # ResumableDataLoader maps config target_col (e.g. target_close) to column "target".
+            # ResumableDataLoader maps the configured target column to column "target".
+            effective_covariates = self._effective_known_covariates_names(
+                fit_data=combined_data,
+                log_context=f"y={year:04d} m={month:02d} branch=combined_window",
+            )
             predictor = TimeSeriesPredictor(
                 target="target",
                 prediction_length=self.prediction_length,
-                known_covariates_names=known_covariates,
+                known_covariates_names=effective_covariates,
                 path=temp_model_path,
             )
             fit_start_time = time.perf_counter()

@@ -126,6 +126,7 @@ class TestIncrementalTrainer:
                 "rollback_enabled": True,
                 "rollback_window_versions": 1,
                 "checkpoint_post_success_cleanup": False,
+                "max_model_checkpoints": 2,
                 "lookback_days": 90,
                 "checkpoint_dir": str(Path(temp_dir) / "checkpoints"),
                 "model_base_path": str(Path(temp_dir) / "models"),
@@ -503,7 +504,7 @@ class TestIncrementalTrainer:
 
         assert result["status"] == "completed"
         assert (
-            "mode=warm_start_from_previous_model" in caplog.text
+            "mode=warm_start_fallback_legacy_predictor" in caplog.text
         ), caplog.text
         assert "mode=fresh_start_fallback_from_previous_model" not in caplog.text
 
@@ -658,3 +659,77 @@ class TestIncrementalTrainer:
         assert "checkpoint_resume_skipped_due_to_window_mismatch" in caplog.text
         assert "mode=resume_from_disk" not in caplog.text
 
+    @patch("chronos_trainer.training.incremental_trainer.TimeSeriesPredictor")
+    def test_train_predictor_passes_intersected_known_covariates(
+        self, mock_predictor_class, temp_dir, sample_data_dir, caplog
+    ):
+        """Configured covariates absent from train_data are omitted; INFO logs missing names."""
+        from autogluon.timeseries import TimeSeriesDataFrame
+
+        cfg = {
+            "model_path": str(Path(temp_dir) / "models"),
+            "model_name": "amazon/chronos-t5-tiny",
+            "context_length": 96,
+            "prediction_length": 24,
+            "learning_rate": 0.001,
+            "batch_size": 32,
+            "max_epochs": 1,
+            "training_preset": "medium_quality",
+            "time_limit": 60,
+            "timestamp_col": "timestamp",
+            "target_col": "target",
+            "item_id_col": "item_id",
+            "parquet_loader": {"data_paths": {"root_dir": sample_data_dir}},
+            "incremental_training": {
+                "chronos_only": True,
+                "chronos_model_variant": "bolt_small",
+                "chronos_local_model_dir": temp_dir,
+                "model_versioning": True,
+                "performance_threshold": 0.05,
+                "rollback_enabled": True,
+                "rollback_window_versions": 1,
+                "checkpoint_post_success_cleanup": False,
+                "max_model_checkpoints": 2,
+                "lookback_days": 90,
+                "checkpoint_dir": str(Path(temp_dir) / "checkpoints"),
+                "model_base_path": str(Path(temp_dir) / "models"),
+                "known_covariates": ["cov_present", "cov_absent"],
+                "fine_tune": {"enabled": False},
+            },
+        }
+        mock_instance = MagicMock()
+        mock_predictor_class.return_value = mock_instance
+
+        raw = pd.DataFrame(
+            {
+                "item_id": ["x"] * 12,
+                "timestamp": pd.date_range("2020-01-01", periods=12, freq="h"),
+                "target": np.linspace(0, 1, 12),
+                "cov_present": 1.0,
+            }
+        )
+        ts_df = TimeSeriesDataFrame.from_data_frame(
+            raw, id_column="item_id", timestamp_column="timestamp"
+        )
+
+        trainer = IncrementalTrainer(cfg)
+        checkpoint_dir = str(Path(temp_dir) / "ck_cov")
+        Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
+        with caplog.at_level(logging.INFO):
+            trainer._train_predictor(
+                previous_predictor=None,
+                ts_df=ts_df,
+                year=2020,
+                month=1,
+                processed_files=[],
+                checkpoint_dir=checkpoint_dir,
+                training_window_start="2020-01-01",
+                training_window_end="2020-01-31",
+            )
+
+        mock_predictor_class.assert_called_once()
+        _args, kwargs = mock_predictor_class.call_args
+        assert kwargs["known_covariates_names"] == ["cov_present"]
+        assert "cov_absent" in caplog.text
+        mock_instance.fit.assert_called_once()

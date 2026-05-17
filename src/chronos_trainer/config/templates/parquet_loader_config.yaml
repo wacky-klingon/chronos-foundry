@@ -3,3 +3,4 @@ parquet_loader:
     root_dir: "/path/to/parquet/root_dir"
   schema:
     datetime_column: "timestamp"
+    target_column: "target"

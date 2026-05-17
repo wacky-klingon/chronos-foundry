@@ -251,10 +251,6 @@ class ResumableDataLoader:
                 self.logger.warning(f"Parquet file is empty: {file_path}")
                 return None
 
-            # Drop date-string columns that carry no signal
-            date_cols = {"spread_10Y_2Y_date", "spread_10Y_3M_date"}
-            df = df.drop(columns=[c for c in date_cols if c in df.columns])
-
             # Force numeric dtype on all feature columns to prevent AutoGluon silently dropping them.
             feature_cols = [
                 col for col in df.columns if col not in ("ds", "item_id", "_year", "_month")
@@ -326,7 +322,7 @@ class ResumableDataLoader:
             # Map target column
             if target_col not in df.columns:
                 # Try common aliases
-                for alias in ["target_close", "value", "target", "y"]:
+                for alias in ["close", "target_close", "value", "target", "y"]:
                     if alias in df.columns:
                         column_mapping[alias] = "target"
                         target_col = "target"
@@ -352,9 +348,10 @@ class ResumableDataLoader:
                 column_mapping[item_id_col] = "item_id"
                 item_id_col = "item_id"
 
-            # Parquet schemas may include both `target_close` (canonical) and a legacy `target`
-            # column. Renaming the configured column to "target" would otherwise yield duplicate
-            # labels and break AutoGluon (df["target"] is not a single Series).
+            # Some datasets may already carry a literal ``target`` column alongside the
+            # configured source column. Renaming the configured source to ``target`` would
+            # otherwise yield duplicate labels and break AutoGluon (``df["target"]`` would
+            # no longer be a single Series).
             sources_mapped_to_target = [k for k, v in column_mapping.items() if v == "target"]
             if sources_mapped_to_target:
                 src_for_target = sources_mapped_to_target[0]

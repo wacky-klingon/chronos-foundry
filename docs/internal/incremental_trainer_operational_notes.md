@@ -15,7 +15,7 @@ Keys belong in the application `incremental_training_config.yaml` (see the-heise
 - `lookback_days`: cap how much prior history is reload each iteration (required for bounded work).
 - `chronos_only`: must be `true` for incremental training.
 - `chronos_model_variant`: one of `bolt_tiny`, `bolt_mini`, `bolt_small`, `bolt_base`.
-- `known_covariates`: macro columns available at forecast time for covariate-aware models.
+- `known_covariates`: macro columns available at forecast time for covariate-aware models. Before each `fit`, the trainer intersects this list with columns on the train `TimeSeriesDataFrame` and passes only that subset to AutoGluon; configured names missing from the frame are omitted and listed once at INFO per fit.
 
 ## Code integration
 

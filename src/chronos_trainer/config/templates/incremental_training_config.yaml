@@ -11,6 +11,7 @@ incremental_training:
   # Pruning occurs after every successful monthly checkpoint save.
   max_model_checkpoints: 2
   lookback_days: 90
+  # known_covariates (optional list): intersected with train frame columns at fit; absent names omitted + INFO.
   excluded_model_types: []
   min_free_bytes: 1073741824
   # Chronos fine-tune hyperparameters passed directly to AutoGluon's Chronos backend.
